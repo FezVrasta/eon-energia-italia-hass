@@ -1,0 +1,65 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "EON Energia",
+        "description": "Inserisci il tuo refresh token EON Energia.\n\n**Come ottenerlo:**\n1. Accedi a https://myeon.eon-energia.com/\n2. Apri gli Strumenti per sviluppatori del browser (F12)\n3. Vai alla scheda Network (Rete)\n4. Aggiorna la pagina\n5. Cerca una richiesta a `https://auth.eon-energia.com/oauth/token`\n6. Cliccaci sopra e controlla la scheda Response (Risposta)\n7. Trova la risposta con `scope: openid profile email offline_access`\n8. Copia il valore di `refresh_token`",
+        "data": {
+          "refresh_token": "Refresh Token"
+        }
+      },
+      "select_pod": {
+        "title": "Seleziona Punto di Consegna",
+        "description": "Seleziona il contatore elettrico (POD) che vuoi monitorare.",
+        "data": {
+          "pod": "Punto di Consegna"
+        }
+      },
+      "select_tariff": {
+        "title": "Seleziona Tipo Tariffa",
+        "description": "Seleziona il tipo di tariffa del tuo contratto elettrico. Monoraria ha una tariffa unica, mentre Bioraria/Multioraria ha tariffe diverse per le ore di punta (F1), intermedie (F2) e fuori punta (F3).",
+        "data": {
+          "tariff_type": "Tipo Tariffa"
+        }
+      },
+      "reconfigure_confirm": {
+        "title": "Riconfigura EON Energia",
+        "description": "Aggiorna il refresh token o il tipo di tariffa per il POD: {pod}",
+        "data": {
+          "refresh_token": "Refresh Token",
+          "tariff_type": "Tipo Tariffa"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Token non valido. Controlla il tuo token e riprova.",
+      "invalid_refresh_token": "Refresh token non valido o scaduto. Ottieni un nuovo token da myeon.eon-energia.com.",
+      "cannot_connect": "Impossibile connettersi all'API EON Energia.",
+      "no_pods": "Nessun contatore elettrico (POD) trovato nel tuo account.",
+      "pod_not_found": "Il POD configurato non è più accessibile con questo token."
+    },
+    "abort": {
+      "already_configured": "Questo contatore è già configurato.",
+      "reconfigure_failed": "Riconfigurazione fallita. Riprova."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opzioni EON Energia",
+        "description": "Aggiorna il refresh token o il tipo di tariffa.",
+        "data": {
+          "refresh_token": "Refresh Token",
+          "tariff_type": "Tipo Tariffa"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Token non valido. Controlla il tuo token e riprova.",
+      "invalid_refresh_token": "Refresh token non valido o scaduto. Ottieni un nuovo token da myeon.eon-energia.com.",
+      "cannot_connect": "Impossibile connettersi all'API EON Energia.",
+      "no_pods": "Nessun contatore elettrico (POD) trovato nel tuo account.",
+      "pod_not_found": "Il POD configurato non è più accessibile con questo token."
+    }
+  }
+}
