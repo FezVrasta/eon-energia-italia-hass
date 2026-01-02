@@ -1,0 +1,35 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "EON Energia",
+        "description": "Enter your EON Energia bearer token (without the 'Bearer ' prefix). You can obtain this by logging into myeon.eon-energia.com and extracting the token from the browser developer tools (Network tab → Authorization header).",
+        "data": {
+          "access_token": "Bearer Token"
+        }
+      },
+      "select_pod": {
+        "title": "Select Point of Delivery",
+        "description": "Select the electricity meter (POD) you want to monitor.",
+        "data": {
+          "pod": "Point of Delivery"
+        }
+      },
+      "select_tariff": {
+        "title": "Select Tariff Type",
+        "description": "Select your electricity tariff type. Monoraria has a single rate, while Bioraria/Multioraria has different rates for peak (F1), mid-peak (F2), and off-peak (F3) hours.",
+        "data": {
+          "tariff_type": "Tariff Type"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid bearer token. Please check your token and try again.",
+      "cannot_connect": "Failed to connect to EON Energia API.",
+      "no_pods": "No electricity meters (PODs) found in your account."
+    },
+    "abort": {
+      "already_configured": "This meter is already configured."
+    }
+  }
+}

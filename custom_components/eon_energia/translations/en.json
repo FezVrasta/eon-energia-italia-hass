@@ -1,0 +1,65 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "EON Energia",
+        "description": "Enter your EON Energia refresh token.\n\n**How to obtain it:**\n1. Log into https://myeon.eon-energia.com/\n2. Open browser Developer Tools (F12)\n3. Go to the Network tab\n4. Refresh the page\n5. Look for a request to `https://auth.eon-energia.com/oauth/token`\n6. Click on it and check the Response tab\n7. Find the response with `scope: openid profile email offline_access`\n8. Copy the `refresh_token` value",
+        "data": {
+          "refresh_token": "Refresh Token"
+        }
+      },
+      "select_pod": {
+        "title": "Select Point of Delivery",
+        "description": "Select the electricity meter (POD) you want to monitor.",
+        "data": {
+          "pod": "Point of Delivery"
+        }
+      },
+      "select_tariff": {
+        "title": "Select Tariff Type",
+        "description": "Select your electricity tariff type. Monoraria has a single rate, while Bioraria/Multioraria has different rates for peak (F1), mid-peak (F2), and off-peak (F3) hours.",
+        "data": {
+          "tariff_type": "Tariff Type"
+        }
+      },
+      "reconfigure_confirm": {
+        "title": "Reconfigure EON Energia",
+        "description": "Update your refresh token or tariff type for POD: {pod}",
+        "data": {
+          "refresh_token": "Refresh Token",
+          "tariff_type": "Tariff Type"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid token. Please check your token and try again.",
+      "invalid_refresh_token": "Invalid or expired refresh token. Please obtain a new one from myeon.eon-energia.com.",
+      "cannot_connect": "Failed to connect to EON Energia API.",
+      "no_pods": "No electricity meters (PODs) found in your account.",
+      "pod_not_found": "The configured POD is no longer accessible with this token."
+    },
+    "abort": {
+      "already_configured": "This meter is already configured.",
+      "reconfigure_failed": "Reconfiguration failed. Please try again."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "EON Energia Options",
+        "description": "Update your refresh token or tariff type.",
+        "data": {
+          "refresh_token": "Refresh Token",
+          "tariff_type": "Tariff Type"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid token. Please check your token and try again.",
+      "invalid_refresh_token": "Invalid or expired refresh token. Please obtain a new one from myeon.eon-energia.com.",
+      "cannot_connect": "Failed to connect to EON Energia API.",
+      "no_pods": "No electricity meters (PODs) found in your account.",
+      "pod_not_found": "The configured POD is no longer accessible with this token."
+    }
+  }
+}

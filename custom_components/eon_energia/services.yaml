@@ -1,0 +1,16 @@
+import_statistics:
+  name: Import Historical Statistics
+  description: Import historical energy consumption data from EON Energia into Home Assistant statistics. This will populate the Energy Dashboard with past data.
+  fields:
+    days:
+      name: Days
+      description: Number of days of historical data to import (1-365). Default is 90 days.
+      required: false
+      default: 90
+      example: 90
+      selector:
+        number:
+          min: 1
+          max: 365
+          mode: box
+          unit_of_measurement: days
