@@ -20,6 +20,8 @@ A custom Home Assistant integration for monitoring electricity consumption from 
 - **Token Status Sensor**: Monitor the health of your API connection
 - **Italian and English translations**
 
+![EON Energia Integration Screenshot](docs/energy-dashboard.png)
+
 ## Installation
 
 ### HACS (Recommended)
@@ -67,6 +69,7 @@ The integration uses OAuth refresh tokens for authentication. The refresh token 
 ## Sensors
 
 ### Cumulative Energy
+
 - **Entity ID**: `sensor.eon_energia_PODID_cumulative_energy`
 - **Unit**: kWh
 - **State Class**: `total`
@@ -77,11 +80,13 @@ The integration uses OAuth refresh tokens for authentication. The refresh token 
   - `statistic_id`: The external statistic ID for Energy Dashboard
 
 For Bioraria/Multioraria tariffs, additional cumulative sensors are created:
+
 - `sensor.eon_energia_PODID_cumulative_energy_peak_f1` - Peak hours (F1)
 - `sensor.eon_energia_PODID_cumulative_energy_mid_peak_f2` - Mid-peak hours (F2)
 - `sensor.eon_energia_PODID_cumulative_energy_off_peak_f3` - Off-peak hours (F3)
 
 ### Daily Consumption
+
 - **Entity ID**: `sensor.eon_energia_PODID_daily_consumption`
 - **Unit**: kWh
 - **State Class**: `total_increasing`
@@ -92,6 +97,7 @@ For Bioraria/Multioraria tariffs, additional cumulative sensors are created:
   - `hourly_breakdown`: Dictionary with all 24 hourly readings
 
 ### Last Hourly Reading
+
 - **Entity ID**: `sensor.eon_energia_PODID_last_reading`
 - **Unit**: kWh
 - **Description**: Most recent hourly reading value.
@@ -100,6 +106,7 @@ For Bioraria/Multioraria tariffs, additional cumulative sensors are created:
   - `reading_date`: Date of the reading
 
 ### Token Status
+
 - **Entity ID**: `sensor.eon_energia_PODID_token_status`
 - **Category**: Diagnostic
 - **Description**: Shows the current status of the API connection (`valid`, `invalid`, or `unknown`).
@@ -118,9 +125,11 @@ Import historical energy consumption data into Home Assistant statistics for use
 **Service**: `eon_energia.import_statistics`
 
 **Parameters**:
+
 - `days` (optional): Number of days to import (1-365, default: 90)
 
 **Example**:
+
 ```yaml
 service: eon_energia.import_statistics
 data:
@@ -128,6 +137,7 @@ data:
 ```
 
 **External Statistics** (for Energy Dashboard):
+
 - **Total Consumption**: `eon_energia:{POD}_consumption`
 - **F1 Peak Hours**: `eon_energia:{POD}_consumption_f1` (Bioraria/Multioraria only)
 - **F2 Mid-Peak Hours**: `eon_energia:{POD}_consumption_f2` (Bioraria/Multioraria only)
@@ -136,10 +146,13 @@ data:
 ## Tariff Types
 
 ### Monoraria
+
 Single tariff rate - same price all day. Only total consumption statistics are created.
 
 ### Bioraria/Multioraria
+
 Multiple tariff rates with different prices based on time of day:
+
 - **F1 (Peak)**: Monday-Friday 8:00-19:00
 - **F2 (Mid-Peak)**: Monday-Friday 7:00-8:00 and 19:00-23:00, Saturday 7:00-23:00
 - **F3 (Off-Peak)**: Nights 23:00-7:00, Sundays, and holidays
@@ -156,6 +169,7 @@ To add EON Energia consumption to the Energy Dashboard:
 ## API Information
 
 This integration uses the EON Energia API:
+
 - **Base URL**: `https://api-mmi.eon.it`
 - **Endpoint**: `/DeeperConsumption/v1.0/ExtDailyConsumption`
 - **Update Interval**: Every 6 hours
@@ -163,24 +177,31 @@ This integration uses the EON Energia API:
 ## Troubleshooting
 
 ### Token expired / Authentication errors
+
 The integration automatically refreshes access tokens using your refresh token. If you see persistent authentication errors:
+
 1. Go to **Settings** → **Devices & Services** → **EON Energia**
 2. Click **Configure** to update your refresh token
 3. Obtain a new refresh token from the web interface (see instructions above)
 
 ### No data
+
 Energy data is typically available with a 2-day delay. The integration automatically fetches the most recent available data (checking up to 7 days back).
 
 ### Empty response
+
 If the API returns empty data, the readings for that date haven't been processed yet by EON Energia.
 
 ### Historical data not showing in Energy Dashboard
+
 1. First, run the `eon_energia.import_statistics` service to backfill historical data
 2. Go to **Developer Tools** → **Statistics** and search for "eon" to verify the data was imported
 3. Add the external statistic (e.g., `eon_energia:{POD}_consumption`) to your Energy Dashboard
 
 ### Token Status shows "invalid"
+
 Check the Token Status sensor's `last_error` attribute for details. Common causes:
+
 - Network connectivity issues
 - EON Energia API temporarily unavailable
 - Refresh token has been revoked (re-login and get a new one)
