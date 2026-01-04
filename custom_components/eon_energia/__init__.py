@@ -71,6 +71,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await api.close()
         return False
 
+    # Get tariff type, default to multioraria for backwards compatibility
+    tariff_type = entry.data.get(CONF_TARIFF_TYPE, TARIFF_MULTIORARIA)
+
     # Track the last imported date to avoid re-importing
     last_imported_date: dict[str, str | None] = {"date": None}
 
@@ -140,9 +143,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Fetch initial data
     await coordinator.async_config_entry_first_refresh()
-
-    # Get tariff type, default to multioraria for backwards compatibility
-    tariff_type = entry.data.get(CONF_TARIFF_TYPE, TARIFF_MULTIORARIA)
 
     hass.data[DOMAIN][entry.entry_id] = {
         "api": api,
