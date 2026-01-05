@@ -275,6 +275,35 @@ class EONEnergiaApi:
             measure_type=measure_type,
         )
 
+    async def get_monthly_consumption(
+        self,
+        pod: str,
+        start_date: datetime,
+        end_date: datetime,
+        measure_type: str = MEASURE_TYPE_EA,
+    ) -> list[dict[str, Any]]:
+        """Get monthly consumption data.
+
+        Args:
+            pod: Point of Delivery code (PR number)
+            start_date: Start date for the data
+            end_date: End date for the data
+            measure_type: Ea (active energy) or Er (reactive energy)
+
+        Returns:
+            List of monthly consumption records with 'data' (YYYY-MM-01) and 'valore_mensile'
+        """
+        from .const import ENDPOINT_MONTHLY_CONSUMPTION
+
+        data = {
+            "DataInizio": start_date.strftime("%Y-%m-%d"),
+            "DataFine": end_date.strftime("%Y-%m-%d"),
+            "PR": pod,
+            "Misura": measure_type,
+        }
+
+        return await self._request("POST", ENDPOINT_MONTHLY_CONSUMPTION, data)
+
     async def get_invoices(
         self,
         start_date: datetime | None = None,

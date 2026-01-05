@@ -91,6 +91,38 @@ def _is_italian_holiday(dt: datetime) -> bool:
     return False
 
 
+def _parse_italian_date(date_str: str | None) -> date | None:
+    """Parse Italian date format DD/MM/YYYY."""
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str, "%d/%m/%Y").date()
+    except ValueError:
+        return None
+
+
+def _get_price_for_date(
+    hass: HomeAssistant,
+    pod: str,
+    target_date: date,
+    fascia: str | None = None,
+) -> tuple[float | None, bool]:
+    """Get the price per kWh for a POD for a specific month.
+
+    Looks up the per-month price calculated from invoices.
+    Returns None for months that haven't been invoiced yet.
+
+    Returns:
+        Tuple of (price, True) if price is available for this month,
+        (None, False) otherwise.
+    """
+    monthly_prices = hass.data[DOMAIN].get("price_per_kwh_monthly", {}).get(pod, {})
+    month_key = (target_date.year, target_date.month)
+    if month_key in monthly_prices:
+        return (monthly_prices[month_key], True)
+    return (None, False)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up EON Energia from a config entry."""
     hass.data.setdefault(DOMAIN, {})
@@ -125,10 +157,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     tariff_type = entry.data.get(CONF_TARIFF_TYPE, TARIFF_MULTIORARIA)
 
     # Track the last imported date to avoid re-importing
-    last_imported_date: dict[str, str | None] = {"date": None}
+    # Also track if historical import is in progress to prevent conflicts
+    import_state: dict[str, Any] = {"last_date": None, "importing_historical": False}
 
     async def async_update_data():
         """Fetch data from EON Energia API and import statistics."""
+        # Skip auto-import if historical import is in progress
+        if import_state.get("importing_historical"):
+            _LOGGER.debug("Skipping auto-import: historical import in progress")
+            # Still fetch and return data for sensors, just don't import statistics
+            try:
+                for days_ago in range(2, 8):
+                    target_date = datetime.now() - timedelta(days=days_ago)
+                    data = await api.get_daily_consumption(
+                        pod=pod,
+                        start_date=target_date,
+                        end_date=target_date,
+                    )
+                    if data and len(data) > 0:
+                        return [data[0] if isinstance(data, list) else data]
+                return []
+            except EONEnergiaApiError:
+                return []
+
         try:
             # EON data has a 2-day delay, try multiple days to find the most recent data
             all_data = []
@@ -156,22 +207,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
 
             # Auto-import statistics for any new days we haven't processed yet
+            # Filter to only days we haven't imported
+            days_to_import = []
             for target_date, day_data in all_data:
                 date_str = target_date.strftime("%Y-%m-%d")
                 data_date = day_data.get("data", date_str)
 
                 # Skip if we've already imported this date
-                if last_imported_date["date"] and data_date <= last_imported_date["date"]:
+                if import_state["last_date"] and data_date <= import_state["last_date"]:
                     continue
+                days_to_import.append((target_date, day_data))
 
-                # Import this day's hourly statistics
-                await _import_day_statistics(
-                    hass, day_data, target_date, pod, tariff_type
+            # Import all new days as a batch to maintain correct running sums
+            if days_to_import:
+                await _import_days_batch(
+                    hass, days_to_import, pod, tariff_type
                 )
 
             # Update the last imported date (use last item = most recent)
             if all_data:
-                last_imported_date["date"] = all_data[-1][1].get(
+                import_state["last_date"] = all_data[-1][1].get(
                     "data", all_data[-1][0].strftime("%Y-%m-%d")
                 )
 
@@ -212,7 +267,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     # Fetch initial invoice data first (to calculate average €/kWh for cost statistics)
-    await invoice_coordinator.async_config_entry_first_refresh()
+    # Use non-blocking refresh so integration still loads if invoice API is down
+    try:
+        await invoice_coordinator.async_config_entry_first_refresh()
+    except Exception as err:
+        _LOGGER.warning(
+            "Could not fetch invoice data during setup (will retry later): %s",
+            err,
+        )
+        # Don't fail setup - invoices are optional, consumption data is the priority
 
     coordinator = DataUpdateCoordinator(
         hass,
@@ -231,6 +294,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "invoice_coordinator": invoice_coordinator,
         "pod": pod,
         "tariff_type": tariff_type,
+        "import_state": import_state,  # Share import state with service handler
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -265,16 +329,80 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
         _LOGGER.info("Starting historical data import for the last %d days", days)
 
-        # Get all configured entries
-        for entry_id, entry_data in hass.data[DOMAIN].items():
+        # Get all configured entries - create a copy to avoid "dictionary changed size during iteration"
+        entries_found = 0
+        for entry_id, entry_data in list(hass.data[DOMAIN].items()):
+            _LOGGER.debug(
+                "Checking entry %s: is_dict=%s, has_api=%s",
+                entry_id,
+                isinstance(entry_data, dict),
+                "api" in entry_data if isinstance(entry_data, dict) else False,
+            )
             if not isinstance(entry_data, dict) or "api" not in entry_data:
                 continue
 
+            entries_found += 1
             api = entry_data["api"]
             pod = entry_data["pod"]
             tariff_type = entry_data.get("tariff_type", TARIFF_MULTIORARIA)
 
-            await _import_historical_statistics(hass, api, pod, days, tariff_type)
+            _LOGGER.info(
+                "Importing statistics for POD %s (tariff: %s, days: %d)",
+                pod,
+                tariff_type,
+                days,
+            )
+
+            # Set flag to prevent concurrent imports from coordinator
+            import_state = entry_data.get("import_state", {})
+            import_state["importing_historical"] = True
+
+            # Ensure invoice data is loaded for pricing (but don't fail if it errors)
+            invoice_coordinator = entry_data.get("invoice_coordinator")
+            if invoice_coordinator:
+                _LOGGER.debug("Refreshing invoice data before import...")
+                try:
+                    await invoice_coordinator.async_request_refresh()
+                except Exception as err:
+                    _LOGGER.warning(
+                        "Could not refresh invoice data (will import without cost): %s",
+                        err,
+                    )
+
+            try:
+                # First import consumption statistics (without cost)
+                # This returns daily consumption data we can use for price calculation
+                daily_consumption = await _import_historical_statistics(
+                    hass, api, pod, days, tariff_type
+                )
+
+                # Now that we have consumption data, calculate invoice prices
+                if invoice_coordinator and invoice_coordinator.data:
+                    _LOGGER.info(
+                        "Calculating invoice prices using %d days of consumption data...",
+                        len(daily_consumption),
+                    )
+                    await _import_invoice_cost_statistics(
+                        hass, api, invoice_coordinator.data, pod, daily_consumption
+                    )
+
+                    # Re-import statistics to include cost data
+                    _LOGGER.info("Re-importing statistics with cost data...")
+                    await _import_historical_statistics(hass, api, pod, days, tariff_type)
+
+                # Update last imported date to prevent coordinator from re-importing
+                # these dates with potentially different sums
+                end_date = datetime.now() - timedelta(days=2)
+                import_state["last_date"] = end_date.strftime("%Y-%m-%d")
+            finally:
+                import_state["importing_historical"] = False
+
+        if entries_found == 0:
+            _LOGGER.warning(
+                "No configured EON Energia entries found. "
+                "Available keys in domain data: %s",
+                list(hass.data[DOMAIN].keys()),
+            )
 
     hass.services.async_register(
         DOMAIN,
@@ -290,24 +418,26 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     return True
 
 
-async def _import_day_statistics(
+async def _import_days_batch(
     hass: HomeAssistant,
-    day_data: dict[str, Any],
-    date: datetime,
+    days_data: list[tuple[datetime, dict[str, Any]]],
     pod: str,
     tariff_type: str = TARIFF_MULTIORARIA,
 ) -> None:
-    """Import a single day's hourly statistics to the recorder.
+    """Import multiple days' statistics in a single batch with correct running sums.
 
-    This function imports hourly energy consumption data as external statistics,
-    which can be used by the Energy Dashboard. It also imports cost statistics
-    if an average price per kWh has been calculated from invoices.
+    This function processes multiple days sequentially, maintaining proper cumulative
+    sums across all days. It retrieves the last known sum once at the start and
+    then builds on it for all subsequent entries.
     """
+    if not days_data:
+        return
+
     is_multioraria = tariff_type == TARIFF_MULTIORARIA
 
-    # Get pricing - prefer per-fascia prices for multioraria, fallback to single price
-    price_per_kwh = hass.data[DOMAIN].get("price_per_kwh", {}).get(pod)
-    fascia_prices = hass.data[DOMAIN].get("price_per_kwh_fascia", {}).get(pod, {})
+    # Check if we have any pricing available
+    monthly_prices = hass.data[DOMAIN].get("price_per_kwh_monthly", {}).get(pod, {})
+    has_pricing = bool(monthly_prices)
 
     # Define statistics based on tariff type
     stat_configs: dict[str, dict[str, Any]] = {
@@ -341,8 +471,167 @@ async def _import_day_statistics(
             },
         })
 
-    # Add cost statistic if we have any price (single rate or per-fascia)
-    if price_per_kwh or fascia_prices:
+    if has_pricing:
+        stat_configs["cost"] = {
+            "id": f"{DOMAIN}:{pod}_cost",
+            "name": f"EON Energia {pod} Cost",
+            "unit": CURRENCY_EURO,
+            "unit_class": None,
+        }
+
+    # Get current running sums from existing statistics ONCE at the start
+    running_sums: dict[str, float] = {}
+    for key, config in stat_configs.items():
+        statistic_id = config["id"]
+        last_stats = await get_instance(hass).async_add_executor_job(
+            get_last_statistics, hass, 1, statistic_id, True, {"sum", "start"}
+        )
+        if last_stats and statistic_id in last_stats:
+            last_entry = last_stats[statistic_id][0]
+            running_sums[key] = last_entry["sum"]
+            _LOGGER.debug(
+                "Batch import: found existing %s sum=%.3f from start=%s",
+                statistic_id,
+                last_entry["sum"],
+                last_entry.get("start"),
+            )
+        else:
+            running_sums[key] = 0.0
+            _LOGGER.debug("Batch import: no existing data for %s, starting from 0", statistic_id)
+
+    # Process all days and build statistics
+    statistics: dict[str, list[StatisticData]] = {key: [] for key in stat_configs}
+
+    for date, day_data in days_data:
+        for hour in range(1, 25):
+            field_key = f"valore_h{hour:02d}"
+            if field_key not in day_data:
+                continue
+
+            try:
+                hourly_value = float(day_data[field_key])
+                if hourly_value <= 0:
+                    continue
+
+                # Create statistic timestamp
+                local_day_start = dt_util.start_of_local_day(date)
+                stat_time = local_day_start + timedelta(hours=hour - 1)
+
+                # Update total consumption
+                running_sums["total"] += hourly_value
+                statistics["total"].append(
+                    StatisticData(
+                        start=stat_time,
+                        sum=running_sums["total"],
+                        state=hourly_value,
+                    )
+                )
+
+                # Update fascia-specific statistics
+                fascia = None
+                if is_multioraria:
+                    fascia = _get_fascia_for_hour(date, hour)
+                    running_sums[fascia] += hourly_value
+                    statistics[fascia].append(
+                        StatisticData(
+                            start=stat_time,
+                            sum=running_sums[fascia],
+                            state=hourly_value,
+                        )
+                    )
+
+                # Update cost statistics
+                if has_pricing:
+                    hourly_price, _ = _get_price_for_date(hass, pod, date.date(), fascia)
+                    if hourly_price:
+                        hourly_cost = hourly_value * hourly_price
+                        running_sums["cost"] += hourly_cost
+                        statistics["cost"].append(
+                            StatisticData(
+                                start=stat_time,
+                                sum=running_sums["cost"],
+                                state=hourly_cost,
+                            )
+                        )
+
+            except (ValueError, TypeError):
+                continue
+
+    # Import all statistics at once
+    for key, config in stat_configs.items():
+        if statistics[key]:
+            metadata = StatisticMetaData(
+                has_mean=False,
+                has_sum=True,
+                mean_type=StatisticMeanType.NONE,
+                name=config["name"],
+                source=DOMAIN,
+                statistic_id=config["id"],
+                unit_of_measurement=config["unit"],
+                unit_class=config["unit_class"],
+            )
+            async_add_external_statistics(hass, metadata, statistics[key])
+
+    _LOGGER.info(
+        "Batch imported %d days of statistics (total: %.3f kWh)",
+        len(days_data),
+        running_sums["total"],
+    )
+
+
+async def _import_day_statistics(
+    hass: HomeAssistant,
+    day_data: dict[str, Any],
+    date: datetime,
+    pod: str,
+    tariff_type: str = TARIFF_MULTIORARIA,
+) -> None:
+    """Import a single day's hourly statistics to the recorder.
+
+    This function imports hourly energy consumption data as external statistics,
+    which can be used by the Energy Dashboard. It also imports cost statistics
+    using date-specific pricing from invoices when available.
+    """
+    is_multioraria = tariff_type == TARIFF_MULTIORARIA
+
+    # Check if we have any pricing available (for cost statistic setup)
+    monthly_prices = hass.data[DOMAIN].get("price_per_kwh_monthly", {}).get(pod, {})
+    has_pricing = bool(monthly_prices)
+
+    # Define statistics based on tariff type
+    stat_configs: dict[str, dict[str, Any]] = {
+        "total": {
+            "id": f"{DOMAIN}:{pod}_consumption",
+            "name": f"EON Energia {pod} Consumption",
+            "unit": UnitOfEnergy.KILO_WATT_HOUR,
+            "unit_class": SensorDeviceClass.ENERGY,
+        },
+    }
+
+    if is_multioraria:
+        stat_configs.update({
+            "F1": {
+                "id": f"{DOMAIN}:{pod}_consumption_f1",
+                "name": f"EON Energia {pod} F1 (Peak)",
+                "unit": UnitOfEnergy.KILO_WATT_HOUR,
+                "unit_class": SensorDeviceClass.ENERGY,
+            },
+            "F2": {
+                "id": f"{DOMAIN}:{pod}_consumption_f2",
+                "name": f"EON Energia {pod} F2 (Mid-peak)",
+                "unit": UnitOfEnergy.KILO_WATT_HOUR,
+                "unit_class": SensorDeviceClass.ENERGY,
+            },
+            "F3": {
+                "id": f"{DOMAIN}:{pod}_consumption_f3",
+                "name": f"EON Energia {pod} F3 (Off-peak)",
+                "unit": UnitOfEnergy.KILO_WATT_HOUR,
+                "unit_class": SensorDeviceClass.ENERGY,
+            },
+        })
+
+    # Add cost statistic if we have any pricing available
+    if has_pricing:
         stat_configs["cost"] = {
             "id": f"{DOMAIN}:{pod}_cost",
             "name": f"EON Energia {pod} Cost",
@@ -355,12 +644,20 @@ async def _import_day_statistics(
     for key, config in stat_configs.items():
         statistic_id = config["id"]
         last_stats = await get_instance(hass).async_add_executor_job(
-            get_last_statistics, hass, 1, statistic_id, True, {"sum"}
+            get_last_statistics, hass, 1, statistic_id, True, {"sum", "start"}
         )
         if last_stats and statistic_id in last_stats:
-            running_sums[key] = last_stats[statistic_id][0]["sum"]
+            last_entry = last_stats[statistic_id][0]
+            running_sums[key] = last_entry["sum"]
+            _LOGGER.debug(
+                "Day import: found existing %s sum=%.3f from start=%s",
+                statistic_id,
+                last_entry["sum"],
+                last_entry.get("start"),
+            )
         else:
             running_sums[key] = 0.0
+            _LOGGER.debug("Day import: no existing data for %s, starting from 0", statistic_id)
 
     # Process each hourly value and create statistics
     statistics: dict[str, list[StatisticData]] = {key: [] for key in stat_configs}
@@ -376,10 +673,9 @@ async def _import_day_statistics(
                 continue
 
             # Create statistic timestamp (hour 1 = 00:00-01:00)
-            stat_time = dt_util.as_utc(
-                datetime.combine(date.date(), datetime.min.time())
-                + timedelta(hours=hour - 1)
-            )
+            # Use dt_util.start_of_local_day for proper timezone handling
+            local_day_start = dt_util.start_of_local_day(date)
+            stat_time = local_day_start + timedelta(hours=hour - 1)
 
             # Update total consumption
             running_sums["total"] += hourly_value
@@ -404,15 +700,11 @@ async def _import_day_statistics(
                     )
                 )
 
-            # Update cost statistics - use per-fascia price if available
-            if price_per_kwh or fascia_prices:
-                # Determine price to use: per-fascia if available, otherwise single rate
-                if fascia and fascia in fascia_prices:
-                    hourly_price = fascia_prices[fascia]
-                elif price_per_kwh:
-                    hourly_price = price_per_kwh
-                else:
-                    hourly_price = None
+            # Update cost statistics - use date-specific pricing from invoices
+            if has_pricing:
+                hourly_price, is_from_invoice = _get_price_for_date(
+                    hass, pod, date.date(), fascia
+                )
 
                 if hourly_price:
                     hourly_cost = hourly_value * hourly_price
@@ -427,6 +719,10 @@ async def _import_day_statistics(
 
         except (ValueError, TypeError):
             continue
+
+    # Track whether we used invoice pricing or fallback
+    _, is_from_invoice = _get_price_for_date(hass, pod, date.date())
+    pricing_source = "from invoice" if is_from_invoice else "estimated"
 
     # Import statistics for each type
     for key, config in stat_configs.items():
@@ -444,14 +740,14 @@ async def _import_day_statistics(
             async_add_external_statistics(hass, metadata, statistics[key])
 
     data_date = day_data.get("data", date.strftime("%Y-%m-%d"))
-    if price_per_kwh or fascia_prices:
+    if has_pricing:
         _LOGGER.info(
-            "Auto-imported %d hourly statistics for %s (total: %.3f kWh, cost: €%.2f%s)",
+            "Auto-imported %d hourly statistics for %s (total: %.3f kWh, cost: €%.2f - %s)",
             len(statistics["total"]),
             data_date,
             running_sums["total"],
             running_sums.get("cost", 0),
-            " using per-fascia pricing" if fascia_prices else "",
+            pricing_source,
         )
     else:
         _LOGGER.info(
@@ -502,13 +798,31 @@ async def _import_historical_statistics(
     pod: str,
     days: int,
     tariff_type: str = TARIFF_MULTIORARIA,
-) -> None:
-    """Import historical statistics from EON Energia API."""
+) -> dict[str, float]:
+    """Import historical statistics from EON Energia API.
+
+    Returns:
+        Dict mapping date strings (YYYY-MM-DD) to daily kWh consumption totals.
+        This can be used to calculate invoice prices.
+    """
+    _LOGGER.info(
+        "Starting _import_historical_statistics for POD %s (days: %d, tariff: %s)",
+        pod,
+        days,
+        tariff_type,
+    )
+
     is_multioraria = tariff_type == TARIFF_MULTIORARIA
 
-    # Get pricing - prefer per-fascia prices for multioraria, fallback to single price
-    price_per_kwh = hass.data[DOMAIN].get("price_per_kwh", {}).get(pod)
-    fascia_prices = hass.data[DOMAIN].get("price_per_kwh_fascia", {}).get(pod, {})
+    # Check if we have any pricing available (for cost statistic setup)
+    monthly_prices = hass.data[DOMAIN].get("price_per_kwh_monthly", {}).get(pod, {})
+    has_pricing = bool(monthly_prices)
+
+    _LOGGER.info(
+        "Pricing info: %d months with prices: %s",
+        len(monthly_prices),
+        list(monthly_prices.keys()) if monthly_prices else "none",
+    )
 
     # Define statistics based on tariff type
     stat_configs: dict[str, dict[str, Any]] = {
@@ -543,8 +857,8 @@ async def _import_historical_statistics(
             },
         })
 
-    # Add cost statistic if we have any price (single rate or per-fascia)
-    if price_per_kwh or fascia_prices:
+    # Add cost statistic if we have any pricing available
+    if has_pricing:
         stat_configs["cost"] = {
             "id": f"{DOMAIN}:{pod}_cost",
             "name": f"EON Energia {pod} Cost",
@@ -553,143 +867,137 @@ async def _import_historical_statistics(
         }
 
     # Initialize running sums and statistics lists
+    # For historical import, we always start from 0 since we're importing a fresh set of data
+    # The async_add_external_statistics will handle merging/replacing existing data
     running_sums: dict[str, float] = {}
     statistics: dict[str, list[StatisticData]] = {}
 
     for key, config in stat_configs.items():
-        statistic_id = config["id"]
-
-        # Get last known statistic to continue from there
-        last_stats = await get_instance(hass).async_add_executor_job(
-            get_last_statistics, hass, 1, statistic_id, True, {"sum"}
-        )
-
-        if last_stats and statistic_id in last_stats:
-            running_sums[key] = last_stats[statistic_id][0]["sum"]
-            _LOGGER.debug("Last known sum for %s: %s", statistic_id, running_sums[key])
-        else:
-            running_sums[key] = 0.0
-            _LOGGER.debug("No previous statistics found for %s, starting from 0", statistic_id)
-
+        # Start from 0 for historical import - we're rebuilding the statistics
+        running_sums[key] = 0.0
         statistics[key] = []
+        _LOGGER.debug("Initializing %s sum to 0 for historical import", config["id"])
 
-    end_date = datetime.now() - timedelta(days=2)  # API has 2-day delay
+    # Use timezone-aware dates to avoid DST issues
+    # The API dates are in local Italian time, so we use that for consistency
+    now = dt_util.now()  # Timezone-aware datetime
+    end_date = now - timedelta(days=2)  # API has 2-day delay
     start_date = end_date - timedelta(days=days)
 
-    price_info = "not available"
-    if fascia_prices:
-        price_info = f"F1=€{fascia_prices.get('F1', 0):.4f}, F2=€{fascia_prices.get('F2', 0):.4f}, F3=€{fascia_prices.get('F3', 0):.4f}/kWh"
-    elif price_per_kwh:
-        price_info = f"€{price_per_kwh:.4f}/kWh"
+    # Count invoiced vs estimated days for logging
+    invoiced_days = 0
+    estimated_days = 0
+
+    # Track daily consumption for invoice price calculation
+    daily_consumption: dict[str, float] = {}
 
     _LOGGER.info(
-        "Fetching EON Energia data from %s to %s (tariff: %s, price: %s)",
+        "Fetching EON Energia data from %s to %s (tariff: %s)",
         start_date.strftime("%Y-%m-%d"),
         end_date.strftime("%Y-%m-%d"),
         tariff_type,
-        price_info,
     )
 
-    # Fetch data day by day
-    current_date = start_date
-    while current_date <= end_date:
+    # Fetch all data in one API call
+    try:
+        all_data = await api.get_daily_consumption(
+            pod=pod,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except EONEnergiaApiError as err:
+        _LOGGER.error("Failed to fetch consumption data: %s", err)
+        return daily_consumption
+
+    if not all_data:
+        _LOGGER.warning("No consumption data returned from API")
+        return daily_consumption
+
+    _LOGGER.info("Received %d days of consumption data", len(all_data))
+
+    # Process each day's data
+    for day_data in all_data:
+        # Parse the date from the data
+        date_str = day_data.get("data")
+        if not date_str:
+            continue
+
         try:
-            data = await api.get_daily_consumption(
-                pod=pod,
-                start_date=current_date,
-                end_date=current_date,
-            )
+            current_date = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            continue
 
-            if data and len(data) > 0:
-                day_data = data[0]
+        day_total = 0.0
 
-                # Process each hourly value
-                for hour in range(1, 25):
-                    field_key = f"valore_h{hour:02d}"
-                    if field_key in day_data:
-                        try:
-                            hourly_value = float(day_data[field_key])
-                            if hourly_value > 0:
-                                # Create statistic timestamp
-                                # hour 1 = 00:00-01:00, hour 24 = 23:00-00:00
-                                stat_time = dt_util.as_utc(
-                                    datetime.combine(
-                                        current_date.date(),
-                                        datetime.min.time()
-                                    ) + timedelta(hours=hour - 1)
-                                )
+        # Process each hourly value
+        for hour in range(1, 25):
+            field_key = f"valore_h{hour:02d}"
+            if field_key not in day_data:
+                continue
 
-                                # Update total
-                                running_sums["total"] += hourly_value
-                                statistics["total"].append(
-                                    StatisticData(
-                                        start=stat_time,
-                                        sum=running_sums["total"],
-                                        state=hourly_value,
-                                    )
-                                )
+            try:
+                raw_value = day_data[field_key]
+                hourly_value = float(raw_value) if raw_value is not None else 0.0
 
-                                # Update fascia-specific statistic (only for multioraria)
-                                fascia = None
-                                if is_multioraria:
-                                    fascia = _get_fascia_for_hour(current_date, hour)
-                                    running_sums[fascia] += hourly_value
-                                    statistics[fascia].append(
-                                        StatisticData(
-                                            start=stat_time,
-                                            sum=running_sums[fascia],
-                                            state=hourly_value,
-                                        )
-                                    )
+                if hourly_value <= 0:
+                    continue
 
-                                # Update cost statistics - use per-fascia price if available
-                                if price_per_kwh or fascia_prices:
-                                    # Determine price to use: per-fascia if available, otherwise single rate
-                                    if fascia and fascia in fascia_prices:
-                                        hourly_price = fascia_prices[fascia]
-                                    elif price_per_kwh:
-                                        hourly_price = price_per_kwh
-                                    else:
-                                        hourly_price = None
+                day_total += hourly_value
 
-                                    if hourly_price:
-                                        hourly_cost = hourly_value * hourly_price
-                                        running_sums["cost"] += hourly_cost
-                                        statistics["cost"].append(
-                                            StatisticData(
-                                                start=stat_time,
-                                                sum=running_sums["cost"],
-                                                state=hourly_cost,
-                                            )
-                                        )
+                # Create statistic timestamp
+                local_day_start = dt_util.start_of_local_day(current_date)
+                stat_time = local_day_start + timedelta(hours=hour - 1)
 
-                        except (ValueError, TypeError):
-                            pass
+                # Update total
+                running_sums["total"] += hourly_value
+                statistics["total"].append(
+                    StatisticData(
+                        start=stat_time,
+                        sum=running_sums["total"],
+                        state=hourly_value,
+                    )
+                )
 
+                # Update fascia-specific statistic (only for multioraria)
+                fascia = None
                 if is_multioraria:
-                    _LOGGER.debug(
-                        "Processed %s: total=%.3f, F1=%.3f, F2=%.3f, F3=%.3f kWh",
-                        current_date.strftime("%Y-%m-%d"),
-                        running_sums["total"],
-                        running_sums.get("F1", 0),
-                        running_sums.get("F2", 0),
-                        running_sums.get("F3", 0),
-                    )
-                else:
-                    _LOGGER.debug(
-                        "Processed %s: total=%.3f kWh",
-                        current_date.strftime("%Y-%m-%d"),
-                        running_sums["total"],
+                    fascia = _get_fascia_for_hour(current_date, hour)
+                    running_sums[fascia] += hourly_value
+                    statistics[fascia].append(
+                        StatisticData(
+                            start=stat_time,
+                            sum=running_sums[fascia],
+                            state=hourly_value,
+                        )
                     )
 
-        except EONEnergiaApiError as err:
-            _LOGGER.warning(
-                "Failed to fetch data for %s: %s",
-                current_date.strftime("%Y-%m-%d"),
-                err,
-            )
+                # Update cost statistics
+                if has_pricing:
+                    hourly_price, _ = _get_price_for_date(hass, pod, current_date.date(), fascia)
+                    if hourly_price:
+                        hourly_cost = hourly_value * hourly_price
+                        running_sums["cost"] += hourly_cost
+                        statistics["cost"].append(
+                            StatisticData(
+                                start=stat_time,
+                                sum=running_sums["cost"],
+                                state=hourly_cost,
+                            )
+                        )
 
-        current_date += timedelta(days=1)
+            except (ValueError, TypeError):
+                pass
+
+        # Store daily consumption for invoice price calculation
+        if day_total > 0:
+            daily_consumption[date_str] = day_total
+
+        # Track pricing status
+        _, is_from_invoice = _get_price_for_date(hass, pod, current_date.date())
+        if is_from_invoice:
+            invoiced_days += 1
+        else:
+            estimated_days += 1
 
     # Import statistics for each type
     for key, config in stat_configs.items():
@@ -707,62 +1015,25 @@ async def _import_historical_statistics(
             _LOGGER.info("Importing %d hourly statistics for %s", len(statistics[key]), config["name"])
             async_add_external_statistics(hass, metadata, statistics[key])
 
-    if price_per_kwh or fascia_prices:
+    if has_pricing:
         _LOGGER.info(
-            "Historical data import completed for %s (total: %.3f kWh, cost: €%.2f%s)",
+            "Historical data import completed for %s (total: %.3f kWh, cost: €%.2f) - "
+            "%d days from invoices, %d days estimated",
             pod,
             running_sums["total"],
             running_sums.get("cost", 0),
-            " using per-fascia pricing" if fascia_prices else "",
+            invoiced_days,
+            estimated_days,
         )
     else:
-        _LOGGER.info("Historical data import completed for %s", pod)
-
-
-def _calculate_average_price_per_kwh(
-    invoices: list[dict[str, Any]],
-    pod: str,
-) -> float | None:
-    """Calculate average price per kWh from invoices.
-
-    This examines all invoices and calculates an average €/kWh rate
-    that can be used to estimate costs from consumption data.
-
-    Returns:
-        Average price per kWh in EUR, or None if cannot be calculated.
-    """
-    total_cost = 0.0
-    total_kwh = 0.0
-
-    for invoice in invoices:
-        forniture = invoice.get("ListaForniture", [])
-        for fornitura in forniture:
-            # Check both CodiceFornitura and CodicePDR_POD
-            codice_fornitura = fornitura.get("CodiceFornitura", "")
-            codice_pdr_pod = fornitura.get("CodicePDR_POD", "")
-            if pod in (codice_fornitura, codice_pdr_pod):
-                try:
-                    cost = float(fornitura.get("ImportoFornitura", fornitura.get("Importo", 0)))
-                    # Try to get consumption from the invoice if available
-                    kwh = float(fornitura.get("Consumo", 0))
-                    if cost > 0 and kwh > 0:
-                        total_cost += cost
-                        total_kwh += kwh
-                except (ValueError, TypeError):
-                    continue
-                break
-
-    if total_kwh > 0:
-        return total_cost / total_kwh
-
-    # Fallback: estimate from total invoice amounts
-    # Use a typical household average if we can't calculate
-    if total_cost > 0:
-        _LOGGER.debug(
-            "Could not calculate €/kWh from consumption data, using invoice totals"
+        _LOGGER.info(
+            "Historical data import completed for %s (total: %.3f kWh, %d days)",
+            pod,
+            running_sums["total"],
+            len(daily_consumption),
         )
 
-    return None
+    return daily_consumption
 
 
 async def _import_invoice_cost_statistics(
@@ -770,229 +1041,117 @@ async def _import_invoice_cost_statistics(
     api: EONEnergiaApi,
     invoices: list[dict[str, Any]],
     pod: str,
+    daily_consumption: dict[str, float] | None = None,
 ) -> None:
-    """Import invoice cost statistics to the recorder.
+    """Calculate per-month €/kWh from invoices and official monthly consumption.
 
-    This function fetches per-fascia pricing from the energy wallet endpoint
-    and calculates average €/kWh rates for each fascia (F1, F2, F3) and total.
-    Fixed costs (transport, system charges, taxes) are distributed per-kWh and
-    added to the energy price to get accurate total costs.
-    The rates are stored in hass.data for use when importing consumption statistics.
+    Uses the ExtMonthlyConsumption API to get official monthly kWh values,
+    then matches each invoice to its month and calculates €/kWh.
     """
     if not invoices:
+        _LOGGER.warning("Cannot calculate prices: no invoices")
         return
 
-    # Try to get per-fascia pricing from the energy wallet endpoint
-    fascia_prices: dict[str, list[float]] = {"F0": [], "F1": [], "F2": [], "F3": []}
-    # Track fixed costs per kWh to add to energy prices
-    fixed_costs_per_kwh: list[float] = []
+    # Fetch official monthly consumption from API
+    start_date = datetime.now() - timedelta(days=365 * 2)
+    end_date = datetime.now()
 
-    # Get the most recent invoice to fetch energy wallet data
-    for invoice in invoices[:5]:  # Check the 5 most recent invoices
-        invoice_number = invoice.get("Numero") or invoice.get("NumeroDocumento")
-        invoice_date = invoice.get("DataEmissione") or invoice.get("DataDocumento", "")
+    try:
+        monthly_data = await api.get_monthly_consumption(
+            pod=pod,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except EONEnergiaApiError as err:
+        _LOGGER.error("Failed to fetch monthly consumption: %s", err)
+        return
 
-        if not invoice_number:
+    # Build monthly consumption lookup: (year, month) -> kWh
+    monthly_consumption: dict[tuple[int, int], float] = {}
+    for record in monthly_data:
+        data_str = record.get("data")  # Format: "2025-11-01"
+        kwh = record.get("valore_mensile", 0)
+        if data_str and kwh:
+            try:
+                record_date = datetime.strptime(data_str, "%Y-%m-%d")
+                month_key = (record_date.year, record_date.month)
+                monthly_consumption[month_key] = float(kwh)
+            except (ValueError, TypeError):
+                continue
+
+    _LOGGER.info(
+        "Monthly consumption from API: %s",
+        {f"{y}-{m:02d}": f"{kwh:.2f} kWh" for (y, m), kwh in sorted(monthly_consumption.items())},
+    )
+
+    # Process each invoice
+    monthly_prices: dict[tuple[int, int], float] = {}
+
+    for invoice in invoices:
+        invoice_date_str = (
+            invoice.get("DataDocumento")
+            or invoice.get("DataEmissione")
+            or invoice.get("Data")
+        )
+        invoice_date = _parse_italian_date(invoice_date_str)
+        if not invoice_date:
             continue
 
-        # Extract year from invoice date (format: "DD/MM/YYYY")
-        try:
-            if "/" in invoice_date:
-                year = invoice_date.split("/")[-1]
-            else:
-                year = str(datetime.now().year)
-        except (IndexError, ValueError):
-            year = str(datetime.now().year)
-
-        try:
-            wallet_data = await api.get_energy_wallet(invoice_number, year)
-
-            # Get the POD-specific data from codicePR array
-            codice_pr_list = wallet_data.get("codicePR", [])
-
-            for pr_data in codice_pr_list:
-                # Extract per-fascia pricing from componenteEnergia (nested in codicePR)
-                componente_energia = pr_data.get("componenteEnergia", [])
-                for component in componente_energia:
-                    time_slot = component.get("timeSlot", "")
-                    price_str = component.get("price", "0")
-
-                    try:
-                        price = float(price_str)
-                        if price > 0 and time_slot in fascia_prices:
-                            fascia_prices[time_slot].append(price)
-                    except (ValueError, TypeError):
-                        continue
-
-                # Calculate fixed costs per kWh from other cost components
-                # These include: fixed charges, power charges, taxes, etc.
-                total_fixed_cost = 0.0
-                total_kwh = 0.0
-
-                # Get total consumption from consumoTotaleFatturato
-                consumo_list = pr_data.get("consumoTotaleFatturato", [])
-                for consumo in consumo_list:
-                    try:
-                        kwh = float(consumo.get("consume", 0))
-                        total_kwh += kwh
-                    except (ValueError, TypeError):
-                        pass
-
-                # Get fixed costs from amountResume
-                # Fixed costs = "Quota fissa e quota potenza" + "Accise e IVA"
-                # (consumption-based costs are already in the per-kWh price)
-                amount_resume = pr_data.get("amountResume", [])
-                for cost_group in amount_resume:
-                    macro_group = cost_group.get("macroGroup", "")
-                    # Include fixed charges and taxes, exclude consumption-based costs
-                    if macro_group in [
-                        "Quota fissa e quota potenza",
-                        "Accise e IVA",
-                        "Canone Rai",  # RAI TV license if present
-                    ]:
-                        try:
-                            amount = float(cost_group.get("macroGroupAmount", 0))
-                            total_fixed_cost += amount
-                        except (ValueError, TypeError):
-                            pass
-
-                # Calculate fixed cost per kWh if we have both values
-                if total_kwh > 0 and total_fixed_cost > 0:
-                    fixed_per_kwh = total_fixed_cost / total_kwh
-                    fixed_costs_per_kwh.append(fixed_per_kwh)
-                    _LOGGER.debug(
-                        "Invoice %s: fixed costs €%.2f / %.2f kWh = €%.4f/kWh",
-                        invoice_number,
-                        total_fixed_cost,
-                        total_kwh,
-                        fixed_per_kwh,
+        forniture = invoice.get("ListaForniture", [])
+        for fornitura in forniture:
+            codice_fornitura = fornitura.get("CodiceFornitura", "")
+            codice_pdr_pod = fornitura.get("CodicePDR_POD", "")
+            if pod in (codice_fornitura, codice_pdr_pod):
+                try:
+                    amount = float(
+                        fornitura.get("ImportoFornitura") or fornitura.get("Importo", 0)
                     )
-
-            _LOGGER.debug(
-                "Fetched energy wallet for invoice %s: %s",
-                invoice_number,
-                {k: v for k, v in fascia_prices.items() if v},
-            )
-
-        except EONEnergiaApiError as err:
-            _LOGGER.debug(
-                "Could not fetch energy wallet for invoice %s: %s",
-                invoice_number,
-                err,
-            )
-            continue
-
-    # Calculate average fixed cost per kWh
-    avg_fixed_cost_per_kwh = 0.0
-    if fixed_costs_per_kwh:
-        avg_fixed_cost_per_kwh = sum(fixed_costs_per_kwh) / len(fixed_costs_per_kwh)
-        _LOGGER.info(
-            "Average fixed costs for %s: €%.4f/kWh",
-            pod,
-            avg_fixed_cost_per_kwh,
-        )
-
-    # Calculate average prices per fascia (energy price + fixed costs distributed per kWh)
-    avg_prices: dict[str, float] = {}
-
-    # Check if we have F1/F2/F3 pricing (multioraria) or just F0 (monoraria)
-    has_fascia_pricing = any(fascia_prices.get(f) for f in ["F1", "F2", "F3"])
-
-    if has_fascia_pricing:
-        # Use per-fascia pricing + fixed costs
-        for fascia in ["F1", "F2", "F3"]:
-            if fascia_prices[fascia]:
-                energy_price = sum(fascia_prices[fascia]) / len(fascia_prices[fascia])
-                # Add fixed costs per kWh to get total effective price
-                avg_prices[fascia] = energy_price + avg_fixed_cost_per_kwh
-
-        if avg_prices:
-            _LOGGER.info(
-                "Calculated per-fascia electricity prices for %s (including fixed costs €%.4f/kWh): "
-                "F1=€%.4f/kWh, F2=€%.4f/kWh, F3=€%.4f/kWh",
-                pod,
-                avg_fixed_cost_per_kwh,
-                avg_prices.get("F1", 0),
-                avg_prices.get("F2", 0),
-                avg_prices.get("F3", 0),
-            )
-            # Store per-fascia prices (already include fixed costs)
-            hass.data[DOMAIN].setdefault("price_per_kwh_fascia", {})[pod] = avg_prices
-
-            # Also calculate a weighted average for total cost (using typical distribution)
-            # F1: ~30%, F2: ~25%, F3: ~45% (typical household)
-            if all(f in avg_prices for f in ["F1", "F2", "F3"]):
-                weighted_avg = (
-                    avg_prices["F1"] * 0.30 +
-                    avg_prices["F2"] * 0.25 +
-                    avg_prices["F3"] * 0.45
-                )
-                hass.data[DOMAIN].setdefault("price_per_kwh", {})[pod] = weighted_avg
-    elif fascia_prices["F0"]:
-        # Single rate (monoraria) - use F0 price + fixed costs
-        energy_price = sum(fascia_prices["F0"]) / len(fascia_prices["F0"])
-        total_price = energy_price + avg_fixed_cost_per_kwh
-        _LOGGER.info(
-            "Calculated single-rate electricity price for %s: €%.4f/kWh "
-            "(energy: €%.4f + fixed: €%.4f)",
-            pod,
-            total_price,
-            energy_price,
-            avg_fixed_cost_per_kwh,
-        )
-        hass.data[DOMAIN].setdefault("price_per_kwh", {})[pod] = total_price
-    else:
-        # Fallback: calculate from invoice totals
-        avg_price = _calculate_average_price_per_kwh(invoices, pod)
-
-        if avg_price is not None:
-            _LOGGER.info(
-                "Calculated average electricity price for %s: €%.4f/kWh (from invoices)",
-                pod,
-                avg_price,
-            )
-            hass.data[DOMAIN].setdefault("price_per_kwh", {})[pod] = avg_price
-        else:
-            # Try to estimate from total costs and consumption statistics
-            consumption_stat_id = f"{DOMAIN}:{pod}_consumption"
-            last_stats = await get_instance(hass).async_add_executor_job(
-                get_last_statistics, hass, 1, consumption_stat_id, True, {"sum"}
-            )
-
-            total_kwh = 0.0
-            if last_stats and consumption_stat_id in last_stats:
-                total_kwh = last_stats[consumption_stat_id][0].get("sum", 0)
-
-            # Calculate total invoice cost for this POD
-            total_cost = 0.0
-            for invoice in invoices:
-                forniture = invoice.get("ListaForniture", [])
-                for fornitura in forniture:
-                    codice_fornitura = fornitura.get("CodiceFornitura", "")
-                    codice_pdr_pod = fornitura.get("CodicePDR_POD", "")
-                    if pod in (codice_fornitura, codice_pdr_pod):
-                        try:
-                            total_cost += float(fornitura.get("ImportoFornitura", fornitura.get("Importo", 0)))
-                        except (ValueError, TypeError):
-                            pass
+                    if amount <= 0:
                         break
 
-            if total_kwh > 0 and total_cost > 0:
-                avg_price = total_cost / total_kwh
-                _LOGGER.info(
-                    "Estimated average electricity price for %s: €%.4f/kWh "
-                    "(from €%.2f / %.2f kWh)",
-                    pod,
-                    avg_price,
-                    total_cost,
-                    total_kwh,
-                )
-                hass.data[DOMAIN].setdefault("price_per_kwh", {})[pod] = avg_price
-            else:
-                _LOGGER.debug(
-                    "Could not calculate average price for %s "
-                    "(total_cost=€%.2f, total_kwh=%.2f)",
-                    pod,
-                    total_cost,
-                    total_kwh,
-                )
+                    # Invoice emitted in month M covers month M-1
+                    target_month = invoice_date.month - 1
+                    target_year = invoice_date.year
+                    if target_month == 0:
+                        target_month = 12
+                        target_year -= 1
+
+                    month_key = (target_year, target_month)
+                    month_kwh = monthly_consumption.get(month_key, 0.0)
+
+                    if month_kwh <= 0:
+                        _LOGGER.debug(
+                            "No consumption data for invoice %s month %d-%02d",
+                            invoice.get("Numero"),
+                            target_year,
+                            target_month,
+                        )
+                        break
+
+                    price_per_kwh = amount / month_kwh
+                    monthly_prices[month_key] = price_per_kwh
+
+                    _LOGGER.info(
+                        "Invoice %s (€%.2f) for %d-%02d: %.2f kWh -> €%.4f/kWh",
+                        invoice.get("Numero"),
+                        amount,
+                        target_year,
+                        target_month,
+                        month_kwh,
+                        price_per_kwh,
+                    )
+                except (ValueError, TypeError):
+                    pass
+                break
+
+    if not monthly_prices:
+        _LOGGER.warning("No monthly prices could be calculated")
+        return
+
+    hass.data[DOMAIN].setdefault("price_per_kwh_monthly", {})[pod] = monthly_prices
+
+    _LOGGER.info(
+        "Calculated monthly prices for %s: %s",
+        pod,
+        {f"{y}-{m:02d}": f"€{p:.4f}/kWh" for (y, m), p in sorted(monthly_prices.items())},
+    )

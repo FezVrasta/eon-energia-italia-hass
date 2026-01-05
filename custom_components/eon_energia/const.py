@@ -16,6 +16,7 @@ AUTH_AUTHORIZE_URL = f"https://{AUTH_DOMAIN}/authorize"
 
 # API Endpoints
 ENDPOINT_DAILY_CONSUMPTION = "/DeeperConsumption/v1.0/ExtDailyConsumption"
+ENDPOINT_MONTHLY_CONSUMPTION = "/DeeperConsumption/v1.0/ExtMonthlyConsumption"
 ENDPOINT_ACCOUNTS = "/scsi/accounts/v1.0"
 ENDPOINT_POINT_OF_DELIVERIES = "/scsi/point-of-deliveries/v1.0"
 ENDPOINT_INVOICES = "/scsi/invoices/v1.0/getInvoiceDvc"
