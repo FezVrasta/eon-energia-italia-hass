@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import voluptuous as vol
@@ -41,6 +41,54 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
+
+# Fixed Italian national holidays (month, day)
+ITALIAN_HOLIDAYS_FIXED = [
+    (1, 1),    # Capodanno (New Year's Day)
+    (1, 6),    # Epifania (Epiphany)
+    (4, 25),   # Festa della Liberazione (Liberation Day)
+    (5, 1),    # Festa dei Lavoratori (Labour Day)
+    (6, 2),    # Festa della Repubblica (Republic Day)
+    (8, 15),   # Ferragosto (Assumption of Mary)
+    (11, 1),   # Ognissanti (All Saints' Day)
+    (12, 8),   # Immacolata Concezione (Immaculate Conception)
+    (12, 25),  # Natale (Christmas Day)
+    (12, 26),  # Santo Stefano (St. Stephen's Day)
+]
+
+
+def _calculate_easter(year: int) -> date:
+    """Calculate Easter Sunday for a given year using Anonymous Gregorian algorithm."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _is_italian_holiday(dt: datetime) -> bool:
+    """Check if a date is an Italian national holiday."""
+    # Check fixed holidays
+    if (dt.month, dt.day) in ITALIAN_HOLIDAYS_FIXED:
+        return True
+
+    # Check Easter Monday (Pasquetta) - the only moving holiday on a weekday
+    easter = _calculate_easter(dt.year)
+    easter_monday = easter + timedelta(days=1)
+    if dt.month == easter_monday.month and dt.day == easter_monday.day:
+        return True
+
+    return False
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -419,7 +467,7 @@ def _get_fascia_for_hour(dt: datetime, hour: int) -> str:
 
     F1: Peak hours (Mon-Fri 8:00-19:00)
     F2: Mid-peak hours (Mon-Fri 7:00-8:00, 19:00-23:00, Sat 7:00-23:00)
-    F3: Off-peak hours (nights 23:00-7:00, Sundays, holidays)
+    F3: Off-peak hours (nights 23:00-7:00, Sundays, Italian national holidays)
 
     Note: hour is 1-24 where hour 1 = 00:00-01:00, hour 24 = 23:00-00:00
     """
@@ -428,8 +476,8 @@ def _get_fascia_for_hour(dt: datetime, hour: int) -> str:
 
     weekday = dt.weekday()  # 0=Monday, 6=Sunday
 
-    # Sunday is always F3
-    if weekday == 6:
+    # Sundays and Italian national holidays are always F3
+    if weekday == 6 or _is_italian_holiday(dt):
         return "F3"
 
     # Saturday

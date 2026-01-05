@@ -24,6 +24,7 @@ from homeassistant.helpers.update_coordinator import (
 
 from .api import EONEnergiaApi
 from .const import DOMAIN, CONF_TARIFF_TYPE, TARIFF_MULTIORARIA
+from . import _is_italian_holiday
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -474,7 +475,8 @@ class EONEnergiaCumulativeEnergySensor(RestoreEntity, SensorEntity):
         hour_0_based = hour - 1
         weekday = dt.weekday()
 
-        if weekday == 6:  # Sunday
+        # Sundays and Italian national holidays are always F3
+        if weekday == 6 or _is_italian_holiday(dt):
             return "F3"
         if weekday == 5:  # Saturday
             return "F2" if 7 <= hour_0_based < 23 else "F3"
