@@ -17,6 +17,8 @@ A custom Home Assistant integration for monitoring electricity consumption from 
 - **Hourly Breakdown**: All 24 hourly readings available as sensor attributes
 - **Historical Data Import**: Import up to 365 days of historical consumption data via service
 - **Tariff Support**: Choose between Monoraria (single rate) or Bioraria/Multioraria (F1, F2, F3)
+- **Invoice Tracking**: Monitor invoices, payment status, and costs
+- **Cost Statistics**: Automatic cost calculation from average €/kWh (calculated from invoices)
 - **Token Status Sensor**: Monitor the health of your API connection
 - **Italian and English translations**
 
@@ -114,6 +116,57 @@ For Bioraria/Multioraria tariffs, additional cumulative sensors are created:
   - `pod`: Your POD code
   - `last_error`: Error message if the last update failed
 
+### Latest Invoice
+
+- **Entity ID**: `sensor.eon_energia_PODID_latest_invoice`
+- **Unit**: €
+- **Description**: The amount of the most recent invoice.
+- **Attributes**:
+  - `pod`: Your POD code
+  - `invoice_number`: Invoice document number
+  - `issue_date`: Date the invoice was issued
+  - `due_date`: Payment due date
+  - `payment_status`: Current payment status
+  - `amount_paid`: Amount already paid
+  - `amount_remaining`: Remaining amount to pay
+  - `billing_period_start`: Start of the billing period
+  - `billing_period_end`: End of the billing period
+  - `pod_amount`: Amount specific to this POD (for multi-POD invoices)
+
+### Invoice Payment Status
+
+- **Entity ID**: `sensor.eon_energia_PODID_invoice_payment_status`
+- **Description**: Payment status of the latest invoice (`paid`, `unpaid`, or `partial`).
+- **Attributes**:
+  - `pod`: Your POD code
+  - `invoice_number`: Invoice document number
+  - `due_date`: Payment due date
+  - `total_amount`: Total invoice amount
+  - `amount_paid`: Amount already paid
+  - `amount_remaining`: Remaining amount to pay
+  - `raw_status`: Original status from API
+
+### Unpaid Invoices
+
+- **Entity ID**: `sensor.eon_energia_PODID_unpaid_invoices`
+- **Unit**: €
+- **Description**: Total amount of unpaid invoices.
+- **Attributes**:
+  - `pod`: Your POD code
+  - `unpaid_count`: Number of unpaid invoices
+  - `unpaid_invoices`: List of unpaid invoices with details
+
+### Total Invoiced
+
+- **Entity ID**: `sensor.eon_energia_PODID_total_invoiced`
+- **Unit**: €
+- **State Class**: `total`
+- **Description**: Running total of all invoiced amounts for this POD. Persists across restarts.
+- **Attributes**:
+  - `pod`: Your POD code
+  - `invoice_count`: Number of processed invoices
+  - `processed_invoice_numbers`: List of all processed invoice numbers
+
 ## Services
 
 ### Import Historical Statistics
@@ -142,6 +195,7 @@ data:
 - **F1 Peak Hours**: `eon_energia:{POD}_consumption_f1` (Bioraria/Multioraria only)
 - **F2 Mid-Peak Hours**: `eon_energia:{POD}_consumption_f2` (Bioraria/Multioraria only)
 - **F3 Off-Peak Hours**: `eon_energia:{POD}_consumption_f3` (Bioraria/Multioraria only)
+- **Cost**: `eon_energia:{POD}_cost` (automatically imported from invoices)
 
 ## Tariff Types
 
@@ -171,8 +225,10 @@ To add EON Energia consumption to the Energy Dashboard:
 This integration uses the EON Energia API:
 
 - **Base URL**: `https://api-mmi.eon.it`
-- **Endpoint**: `/DeeperConsumption/v1.0/ExtDailyConsumption`
-- **Update Interval**: Every 6 hours
+- **Consumption Endpoint**: `/DeeperConsumption/v1.0/ExtDailyConsumption`
+- **Invoices Endpoint**: `/scsi/invoices/v1.0/getInvoiceDvc`
+- **Consumption Update Interval**: Every 6 hours
+- **Invoice Update Interval**: Every 24 hours
 
 ## Troubleshooting
 

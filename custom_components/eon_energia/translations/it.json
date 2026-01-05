@@ -61,5 +61,54 @@
       "no_pods": "Nessun contatore elettrico (POD) trovato nel tuo account.",
       "pod_not_found": "Il POD configurato non è più accessibile con questo token."
     }
+  },
+  "services": {
+    "import_statistics": {
+      "name": "Importa Statistiche",
+      "description": "Importa i dati storici di consumo energetico nelle statistiche di Home Assistant per l'uso nel Dashboard Energia.",
+      "fields": {
+        "days": {
+          "name": "Giorni",
+          "description": "Numero di giorni di dati storici da importare (1-365)."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "daily_consumption": {
+        "name": "Consumo Giornaliero"
+      },
+      "last_reading": {
+        "name": "Ultima Lettura Oraria"
+      },
+      "token_status": {
+        "name": "Stato Token"
+      },
+      "cumulative_energy": {
+        "name": "Energia Cumulativa"
+      },
+      "cumulative_energy_f1": {
+        "name": "Energia Cumulativa Punta (F1)"
+      },
+      "cumulative_energy_f2": {
+        "name": "Energia Cumulativa Intermedia (F2)"
+      },
+      "cumulative_energy_f3": {
+        "name": "Energia Cumulativa Fuori Punta (F3)"
+      },
+      "latest_invoice": {
+        "name": "Ultima Fattura"
+      },
+      "invoice_payment_status": {
+        "name": "Stato Pagamento Fattura"
+      },
+      "unpaid_invoices": {
+        "name": "Fatture Non Pagate"
+      },
+      "total_invoiced": {
+        "name": "Totale Fatturato"
+      }
+    }
   }
 }

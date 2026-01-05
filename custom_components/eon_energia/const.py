@@ -18,6 +18,8 @@ AUTH_AUTHORIZE_URL = f"https://{AUTH_DOMAIN}/authorize"
 ENDPOINT_DAILY_CONSUMPTION = "/DeeperConsumption/v1.0/ExtDailyConsumption"
 ENDPOINT_ACCOUNTS = "/scsi/accounts/v1.0"
 ENDPOINT_POINT_OF_DELIVERIES = "/scsi/point-of-deliveries/v1.0"
+ENDPOINT_INVOICES = "/scsi/invoices/v1.0/getInvoiceDvc"
+ENDPOINT_ENERGY_WALLET = "/energyWalletMyEon/v1.0/energyWallet"
 
 # Config keys
 CONF_ACCESS_TOKEN = "access_token"
@@ -41,6 +43,7 @@ GRANULARITY_MONTHLY = "M"
 
 # Update interval (in hours)
 DEFAULT_SCAN_INTERVAL = 6
+INVOICE_SCAN_INTERVAL = 24  # Invoices update less frequently
 
 # Sensor types
 SENSOR_ENERGY_CONSUMPTION = "energy_consumption"
