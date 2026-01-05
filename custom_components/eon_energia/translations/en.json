@@ -61,5 +61,54 @@
       "no_pods": "No electricity meters (PODs) found in your account.",
       "pod_not_found": "The configured POD is no longer accessible with this token."
     }
+  },
+  "services": {
+    "import_statistics": {
+      "name": "Import Statistics",
+      "description": "Import historical energy consumption data into Home Assistant statistics for use in the Energy Dashboard.",
+      "fields": {
+        "days": {
+          "name": "Days",
+          "description": "Number of days of historical data to import (1-365)."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "daily_consumption": {
+        "name": "Daily Consumption"
+      },
+      "last_reading": {
+        "name": "Last Hourly Reading"
+      },
+      "token_status": {
+        "name": "Token Status"
+      },
+      "cumulative_energy": {
+        "name": "Cumulative Energy"
+      },
+      "cumulative_energy_f1": {
+        "name": "Cumulative Energy Peak (F1)"
+      },
+      "cumulative_energy_f2": {
+        "name": "Cumulative Energy Mid-peak (F2)"
+      },
+      "cumulative_energy_f3": {
+        "name": "Cumulative Energy Off-peak (F3)"
+      },
+      "latest_invoice": {
+        "name": "Latest Invoice"
+      },
+      "invoice_payment_status": {
+        "name": "Invoice Payment Status"
+      },
+      "unpaid_invoices": {
+        "name": "Unpaid Invoices"
+      },
+      "total_invoiced": {
+        "name": "Total Invoiced"
+      }
+    }
   }
 }

@@ -16,6 +16,8 @@ from .const import (
     ENDPOINT_DAILY_CONSUMPTION,
     ENDPOINT_ACCOUNTS,
     ENDPOINT_POINT_OF_DELIVERIES,
+    ENDPOINT_INVOICES,
+    ENDPOINT_ENERGY_WALLET,
     GRANULARITY_HOURLY,
     MEASURE_TYPE_EA,
 )
@@ -153,6 +155,7 @@ class EONEnergiaApi:
         method: str,
         endpoint: str,
         data: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
         retry_on_auth_error: bool = True,
     ) -> dict[str, Any]:
         """Make an API request with automatic token refresh."""
@@ -165,6 +168,7 @@ class EONEnergiaApi:
                 url,
                 headers=self._headers,
                 json=data if method == "POST" else None,
+                params=params,
             ) as response:
                 if response.status == 401:
                     # Token expired - try to refresh
@@ -270,6 +274,104 @@ class EONEnergiaApi:
             granularity=GRANULARITY_HOURLY,
             measure_type=measure_type,
         )
+
+    async def get_invoices(
+        self,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get invoices/bills.
+
+        Args:
+            start_date: Start date for invoices (default: 5 years ago)
+            end_date: End date for invoices (default: today)
+
+        Returns:
+            List of invoice dictionaries
+        """
+        if start_date is None:
+            start_date = datetime.now() - timedelta(days=365 * 5)
+        if end_date is None:
+            end_date = datetime.now()
+
+        params = {
+            "apiversion": "v1.0",
+            "documentoDal": start_date.strftime("%d/%m/%Y"),
+            "documentoAl": end_date.strftime("%d/%m/%Y"),
+        }
+
+        response = await self._request("GET", ENDPOINT_INVOICES, params=params)
+        return response.get("ListaFatture", [])
+
+    async def get_invoices_for_pod(
+        self,
+        pod: str,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get invoices filtered by POD.
+
+        Args:
+            pod: Point of Delivery code to filter by
+            start_date: Start date for invoices
+            end_date: End date for invoices
+
+        Returns:
+            List of invoice dictionaries for the specified POD
+        """
+        all_invoices = await self.get_invoices(start_date, end_date)
+
+        _LOGGER.debug("Found %d total invoices", len(all_invoices))
+
+        # Filter invoices that contain this POD
+        # Note: The "pod" parameter might be either:
+        # - The PR/CodiceFornitura (e.g., "10030006784668") from the points of delivery API
+        # - The actual POD code (e.g., "IT001E12530948")
+        # We check both fields to ensure we match correctly
+        pod_invoices = []
+        for invoice in all_invoices:
+            forniture = invoice.get("ListaForniture", [])
+            for fornitura in forniture:
+                # Check if POD matches either CodiceFornitura or CodicePDR_POD
+                codice_fornitura = fornitura.get("CodiceFornitura", "")
+                codice_pdr_pod = fornitura.get("CodicePDR_POD", "")
+
+                if pod in (codice_fornitura, codice_pdr_pod):
+                    pod_invoices.append(invoice)
+                    break
+
+        _LOGGER.debug(
+            "Filtered to %d invoices for POD %s",
+            len(pod_invoices),
+            pod,
+        )
+
+        return pod_invoices
+
+    async def get_energy_wallet(
+        self,
+        invoice_number: str,
+        year: str,
+        commodity: str = "POWER",
+    ) -> dict[str, Any]:
+        """Get energy wallet data for an invoice (includes per-fascia pricing).
+
+        Args:
+            invoice_number: The invoice number (numeroFattura)
+            year: The year of the invoice (e.g., "2025")
+            commodity: Type of commodity ("POWER" for electricity)
+
+        Returns:
+            Dictionary with energy wallet data including componenteEnergia
+            which contains per-fascia (F0, F1, F2, F3) pricing information.
+        """
+        data = {
+            "numeroFattura": invoice_number,
+            "anno": year,
+            "commodity": commodity,
+        }
+
+        return await self._request("POST", ENDPOINT_ENERGY_WALLET, data)
 
     async def validate_token(self) -> bool:
         """Validate the access token by making a test request."""

@@ -13,7 +13,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfEnergy
+from homeassistant.const import CURRENCY_EURO, UnitOfEnergy
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -36,15 +36,22 @@ async def async_setup_entry(
     """Set up EON Energia sensors from a config entry."""
     data = hass.data[DOMAIN][entry.entry_id]
     coordinator = data["coordinator"]
+    invoice_coordinator = data["invoice_coordinator"]
     pod = data["pod"]
     api = data["api"]
     tariff_type = data.get("tariff_type", TARIFF_MULTIORARIA)
 
     entities = [
+        # Consumption sensors
         EONEnergiaDailyConsumptionSensor(coordinator, entry, pod),
         EONEnergiaLastReadingSensor(coordinator, entry, pod),
         EONEnergiaTokenStatusSensor(coordinator, entry, pod, api),
         EONEnergiaCumulativeEnergySensor(coordinator, entry, pod, api),
+        # Invoice sensors
+        EONEnergiaLatestInvoiceSensor(invoice_coordinator, entry, pod),
+        EONEnergiaInvoicePaymentStatusSensor(invoice_coordinator, entry, pod),
+        EONEnergiaUnpaidInvoicesSensor(invoice_coordinator, entry, pod),
+        EONEnergiaTotalInvoicedSensor(invoice_coordinator, entry, pod),
     ]
 
     # Add fascia-specific cumulative sensors for multioraria tariffs
@@ -501,3 +508,363 @@ class EONEnergiaCumulativeEnergySensor(RestoreEntity, SensorEntity):
             attrs["statistic_id"] = f"{DOMAIN}:{self._pod}_consumption"
 
         return attrs
+
+
+class EONEnergiaLatestInvoiceSensor(CoordinatorEntity, SensorEntity):
+    """Sensor for the latest invoice amount."""
+
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_native_unit_of_measurement = CURRENCY_EURO
+    _attr_name = "Latest Invoice"
+    _attr_icon = "mdi:receipt-text"
+
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator,
+        entry: ConfigEntry,
+        pod: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self._pod = pod
+        self._entry = entry
+        self._attr_unique_id = f"{pod}_latest_invoice"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, pod)},
+            "name": f"EON Energia {pod}",
+            "manufacturer": "EON Energia",
+            "model": "Smart Meter",
+        }
+
+    def _get_latest_invoice(self) -> dict[str, Any] | None:
+        """Get the most recent invoice from coordinator data."""
+        if not self.coordinator.data:
+            return None
+
+        invoices = self.coordinator.data
+        if not invoices:
+            return None
+
+        # Sort by issue date (DataEmissione) to get the latest
+        sorted_invoices = sorted(
+            invoices,
+            key=lambda x: datetime.strptime(x.get("DataEmissione", "01/01/1970"), "%d/%m/%Y"),
+            reverse=True,
+        )
+        return sorted_invoices[0] if sorted_invoices else None
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the latest invoice amount."""
+        invoice = self._get_latest_invoice()
+        if not invoice:
+            return None
+
+        try:
+            return float(invoice.get("Importo", 0))
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return additional attributes."""
+        attrs: dict[str, Any] = {
+            "pod": self._pod,
+        }
+
+        invoice = self._get_latest_invoice()
+        if invoice:
+            attrs["invoice_number"] = invoice.get("Numero") or invoice.get("NumeroDocumento")
+            attrs["issue_date"] = invoice.get("DataEmissione")
+            attrs["due_date"] = invoice.get("DataScadenza")
+            attrs["payment_status"] = invoice.get("StatoPagamento")
+            attrs["amount_paid"] = invoice.get("ImportoPagato")
+            attrs["amount_remaining"] = invoice.get("ImportoResiduo")
+
+            # Get period and amount from ListaForniture if available
+            forniture = invoice.get("ListaForniture", [])
+            for fornitura in forniture:
+                codice_fornitura = fornitura.get("CodiceFornitura", "")
+                codice_pdr_pod = fornitura.get("CodicePDR_POD", "")
+                if self._pod in (codice_fornitura, codice_pdr_pod):
+                    attrs["billing_period_start"] = fornitura.get("PeriodoCompetenzaInizio") or fornitura.get("DataInizio")
+                    attrs["billing_period_end"] = fornitura.get("PeriodoCompetenzaFine") or fornitura.get("DataFine")
+                    attrs["pod_amount"] = fornitura.get("ImportoFornitura") or fornitura.get("Importo")
+                    break
+
+        return attrs
+
+
+class EONEnergiaInvoicePaymentStatusSensor(CoordinatorEntity, SensorEntity):
+    """Sensor for invoice payment status."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Invoice Payment Status"
+    _attr_icon = "mdi:credit-card-check"
+
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator,
+        entry: ConfigEntry,
+        pod: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self._pod = pod
+        self._entry = entry
+        self._attr_unique_id = f"{pod}_invoice_payment_status"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, pod)},
+            "name": f"EON Energia {pod}",
+            "manufacturer": "EON Energia",
+            "model": "Smart Meter",
+        }
+
+    def _get_latest_invoice(self) -> dict[str, Any] | None:
+        """Get the most recent invoice from coordinator data."""
+        if not self.coordinator.data:
+            return None
+
+        invoices = self.coordinator.data
+        if not invoices:
+            return None
+
+        sorted_invoices = sorted(
+            invoices,
+            key=lambda x: datetime.strptime(x.get("DataEmissione", "01/01/1970"), "%d/%m/%Y"),
+            reverse=True,
+        )
+        return sorted_invoices[0] if sorted_invoices else None
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the payment status."""
+        invoice = self._get_latest_invoice()
+        if not invoice:
+            return None
+
+        status = invoice.get("StatoPagamento", "")
+        # Translate common statuses
+        status_map = {
+            "PAID": "paid",
+            "NOT_PAID": "unpaid",
+            "PAGATO": "paid",
+            "NON_PAGATO": "unpaid",
+            "DA_PAGARE": "unpaid",
+            "PARZIALMENTE_PAGATO": "partial",
+        }
+        return status_map.get(status.upper(), status.lower())
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return additional attributes."""
+        attrs: dict[str, Any] = {
+            "pod": self._pod,
+        }
+
+        invoice = self._get_latest_invoice()
+        if invoice:
+            attrs["invoice_number"] = invoice.get("Numero") or invoice.get("NumeroDocumento")
+            attrs["due_date"] = invoice.get("DataScadenza")
+            attrs["total_amount"] = invoice.get("Importo")
+            attrs["amount_paid"] = invoice.get("ImportoPagato")
+            attrs["amount_remaining"] = invoice.get("ImportoResiduo")
+            attrs["raw_status"] = invoice.get("StatoPagamento")
+
+        return attrs
+
+
+class EONEnergiaUnpaidInvoicesSensor(CoordinatorEntity, SensorEntity):
+    """Sensor for total unpaid invoice amount."""
+
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_native_unit_of_measurement = CURRENCY_EURO
+    _attr_name = "Unpaid Invoices"
+    _attr_icon = "mdi:cash-clock"
+
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator,
+        entry: ConfigEntry,
+        pod: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self._pod = pod
+        self._entry = entry
+        self._attr_unique_id = f"{pod}_unpaid_invoices"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, pod)},
+            "name": f"EON Energia {pod}",
+            "manufacturer": "EON Energia",
+            "model": "Smart Meter",
+        }
+
+    @property
+    def native_value(self) -> float:
+        """Return the total unpaid amount."""
+        if not self.coordinator.data:
+            return 0.0
+
+        total_unpaid = 0.0
+        for invoice in self.coordinator.data:
+            try:
+                remaining = float(invoice.get("ImportoResiduo", 0))
+                if remaining > 0:
+                    total_unpaid += remaining
+            except (ValueError, TypeError):
+                continue
+
+        return round(total_unpaid, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return additional attributes."""
+        attrs: dict[str, Any] = {
+            "pod": self._pod,
+        }
+
+        if self.coordinator.data:
+            unpaid_invoices = []
+            for invoice in self.coordinator.data:
+                try:
+                    remaining = float(invoice.get("ImportoResiduo", 0))
+                    if remaining > 0:
+                        unpaid_invoices.append({
+                            "number": invoice.get("Numero") or invoice.get("NumeroDocumento"),
+                            "due_date": invoice.get("DataScadenza"),
+                            "amount": remaining,
+                        })
+                except (ValueError, TypeError):
+                    continue
+
+            attrs["unpaid_count"] = len(unpaid_invoices)
+            attrs["unpaid_invoices"] = unpaid_invoices
+
+        return attrs
+
+
+class EONEnergiaTotalInvoicedSensor(RestoreEntity, SensorEntity):
+    """Sensor tracking total invoiced amount over time."""
+
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = CURRENCY_EURO
+    _attr_name = "Total Invoiced"
+    _attr_icon = "mdi:cash-multiple"
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator,
+        entry: ConfigEntry,
+        pod: str,
+    ) -> None:
+        """Initialize the sensor."""
+        self.coordinator = coordinator
+        self._pod = pod
+        self._entry = entry
+        self._attr_unique_id = f"{pod}_total_invoiced"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, pod)},
+            "name": f"EON Energia {pod}",
+            "manufacturer": "EON Energia",
+            "model": "Smart Meter",
+        }
+
+        # State tracking
+        self._total_invoiced: float = 0.0
+        self._processed_invoices: set[str] = set()
+
+    async def async_added_to_hass(self) -> None:
+        """Run when entity about to be added to hass."""
+        await super().async_added_to_hass()
+
+        # Restore previous state
+        if (last_state := await self.async_get_last_state()) is not None:
+            try:
+                if last_state.state not in (None, "unknown", "unavailable"):
+                    self._total_invoiced = float(last_state.state)
+                    _LOGGER.debug(
+                        "Restored total invoiced for %s: %s",
+                        self._attr_unique_id,
+                        self._total_invoiced,
+                    )
+            except (ValueError, TypeError):
+                _LOGGER.warning(
+                    "Could not restore state for %s: %s",
+                    self._attr_unique_id,
+                    last_state.state,
+                )
+
+            # Restore processed invoices from attributes
+            if last_state.attributes:
+                processed = last_state.attributes.get("processed_invoice_numbers", [])
+                if processed:
+                    self._processed_invoices = set(processed)
+
+        # Listen to coordinator updates
+        self.async_on_remove(
+            self.coordinator.async_add_listener(self._handle_coordinator_update)
+        )
+
+        # Process current data if available
+        if self.coordinator.data:
+            self._process_new_invoices()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._process_new_invoices()
+        self.async_write_ha_state()
+
+    def _process_new_invoices(self) -> None:
+        """Process new invoices and update total."""
+        if not self.coordinator.data:
+            return
+
+        for invoice in self.coordinator.data:
+            invoice_number = invoice.get("Numero") or invoice.get("NumeroDocumento")
+            if not invoice_number or invoice_number in self._processed_invoices:
+                continue
+
+            # Get the amount for this POD from the invoice
+            # Check both CodiceFornitura and CodicePDR_POD since either might match
+            amount = 0.0
+            forniture = invoice.get("ListaForniture", [])
+            for fornitura in forniture:
+                codice_fornitura = fornitura.get("CodiceFornitura", "")
+                codice_pdr_pod = fornitura.get("CodicePDR_POD", "")
+                if self._pod in (codice_fornitura, codice_pdr_pod):
+                    try:
+                        amount = float(fornitura.get("ImportoFornitura", fornitura.get("Importo", 0)))
+                    except (ValueError, TypeError):
+                        amount = 0.0
+                    break
+
+            if amount > 0:
+                self._total_invoiced += amount
+                self._processed_invoices.add(invoice_number)
+                _LOGGER.debug(
+                    "Added invoice %s (€%.2f) to total, new total: €%.2f",
+                    invoice_number,
+                    amount,
+                    self._total_invoiced,
+                )
+
+    @property
+    def native_value(self) -> float:
+        """Return the total invoiced amount."""
+        return round(self._total_invoiced, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return additional attributes."""
+        return {
+            "pod": self._pod,
+            "invoice_count": len(self._processed_invoices),
+            "processed_invoice_numbers": list(self._processed_invoices),
+        }
