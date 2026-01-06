@@ -8,7 +8,8 @@ API_SUBSCRIPTION_KEY = "3ab3ed651f7142a8a039dc61d081fbe5"
 
 # OAuth Configuration (Auth0)
 AUTH_DOMAIN = "auth.eon-energia.com"
-AUTH_CLIENT_ID = "cGfV5ddN6z7ezg48gfmiRNagTPp6tsVy"
+# iOS app client_id - allows custom redirect URIs for native apps
+AUTH_CLIENT_ID = "vEZ41cyr2pOHux9EKoN8dDgGb7UZc7EB"
 AUTH_AUDIENCE = "https://api-mmi.eon.it"
 AUTH_SCOPE = "openid profile email offline_access"
 AUTH_TOKEN_URL = f"https://{AUTH_DOMAIN}/oauth/token"

@@ -2,10 +2,10 @@
   "config": {
     "step": {
       "user": {
-        "title": "EON Energia",
-        "description": "Enter your EON Energia refresh token.\n\n**How to obtain it:**\n1. Log into https://myeon.eon-energia.com/\n2. Open browser Developer Tools (F12)\n3. Go to the Network tab\n4. Refresh the page\n5. Look for a request to `https://auth.eon-energia.com/oauth/token`\n6. Click on it and check the Response tab\n7. Find the response with `scope: openid profile email offline_access`\n8. Copy the `refresh_token` value",
+        "title": "EON Energia Login",
+        "description": "To connect your EON Energia account:\n\n1. **Copy** this URL and open it in a new browser tab:\n\n`{auth_url}`\n\n2. Log in with your EON Energia credentials\n3. After login, the browser will try to open an app and show an error - **this is expected!**\n4. Open your browser's **Developer Tools** (press F12 or Cmd+Option+I on Mac)\n5. Look in the **Console** tab for an error like: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Right-click** on the URL and select \"Copy link address\" to copy the entire URL, then paste it below",
         "data": {
-          "refresh_token": "Refresh Token"
+          "callback_url": "Callback URL"
         }
       },
       "select_pod": {
@@ -24,19 +24,20 @@
       },
       "reconfigure_confirm": {
         "title": "Reconfigure EON Energia",
-        "description": "Update your refresh token or tariff type for POD: {pod}",
+        "description": "Update credentials for POD {pod}.\n\n1. **Copy** this URL and open it in a new browser tab:\n\n`{auth_url}`\n\n2. Log in with your EON Energia credentials\n3. After login, the browser will try to open an app and show an error - **this is expected!**\n4. Open your browser's **Developer Tools** (press F12 or Cmd+Option+I on Mac)\n5. Look in the **Console** tab for an error like: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Right-click** on the URL and select \"Copy link address\" to copy the entire URL, then paste it below",
         "data": {
-          "refresh_token": "Refresh Token",
+          "callback_url": "Callback URL",
           "tariff_type": "Tariff Type"
         }
       }
     },
     "error": {
-      "invalid_auth": "Invalid token. Please check your token and try again.",
-      "invalid_refresh_token": "Invalid or expired refresh token. Please obtain a new one from myeon.eon-energia.com.",
+      "invalid_auth": "Invalid credentials or authorization code. The code may have expired - please try the login process again.",
+      "invalid_refresh_token": "Invalid or expired refresh token.",
       "cannot_connect": "Failed to connect to EON Energia API.",
       "no_pods": "No electricity meters (PODs) found in your account.",
-      "pod_not_found": "The configured POD is no longer accessible with this token."
+      "no_code": "Please paste the callback URL from the browser console error message.",
+      "pod_not_found": "The configured POD is no longer accessible with this account."
     },
     "abort": {
       "already_configured": "This meter is already configured.",
@@ -47,25 +48,25 @@
     "step": {
       "init": {
         "title": "EON Energia Options",
-        "description": "Update your refresh token or tariff type.",
+        "description": "Update settings for POD {pod}.\n\nTo change your tariff type only, just select the new tariff below.\n\nTo re-authenticate (if your token expired):\n1. **Copy** this URL and open it in a new browser tab:\n\n`{auth_url}`\n\n2. Log in with your EON Energia credentials\n3. After login, the browser will try to open an app and show an error - **this is expected!**\n4. Open your browser's **Developer Tools** (press F12 or Cmd+Option+I on Mac)\n5. Look in the **Console** tab for an error like: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Right-click** on the URL and select \"Copy link address\" to copy the entire URL, then paste it below",
         "data": {
-          "refresh_token": "Refresh Token",
+          "callback_url": "Callback URL (optional - only if re-authenticating)",
           "tariff_type": "Tariff Type"
         }
       }
     },
     "error": {
-      "invalid_auth": "Invalid token. Please check your token and try again.",
-      "invalid_refresh_token": "Invalid or expired refresh token. Please obtain a new one from myeon.eon-energia.com.",
+      "invalid_auth": "Invalid credentials.",
+      "invalid_refresh_token": "Invalid or expired refresh token.",
       "cannot_connect": "Failed to connect to EON Energia API.",
       "no_pods": "No electricity meters (PODs) found in your account.",
-      "pod_not_found": "The configured POD is no longer accessible with this token."
+      "pod_not_found": "The configured POD is no longer accessible with this account."
     }
   },
   "services": {
     "import_statistics": {
       "name": "Import Statistics",
-      "description": "Import historical energy consumption data into Home Assistant statistics for use in the Energy Dashboard.",
+      "description": "Import historical energy consumption data into Home Assistant statistics for use in the Energy Dashboard. This can take several minutes depending on the number of days to import.",
       "fields": {
         "days": {
           "name": "Days",

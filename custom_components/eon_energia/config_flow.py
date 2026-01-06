@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
+import re
+import secrets
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import voluptuous as vol
 
@@ -18,6 +23,11 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import EONEnergiaApi, EONEnergiaApiError, EONEnergiaAuthError
 from .const import (
+    AUTH_AUDIENCE,
+    AUTH_AUTHORIZE_URL,
+    AUTH_CLIENT_ID,
+    AUTH_SCOPE,
+    AUTH_TOKEN_URL,
     CONF_ACCESS_TOKEN,
     CONF_POD,
     CONF_REFRESH_TOKEN,
@@ -28,6 +38,84 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# iOS app redirect URI - browser can't handle it but will show the code
+REDIRECT_URI = "com.eon-energia.eon.auth0://auth.eon-energia.com/ios/com.eon-energia.eon/callback"
+
+
+def _generate_pkce_pair() -> tuple[str, str]:
+    """Generate PKCE code verifier and challenge."""
+    # Generate a random code verifier (43-128 chars, URL-safe)
+    code_verifier = secrets.token_urlsafe(32)
+
+    # Create code challenge using S256 method
+    code_challenge_digest = hashlib.sha256(code_verifier.encode()).digest()
+    code_challenge = base64.urlsafe_b64encode(code_challenge_digest).rstrip(b"=").decode()
+
+    return code_verifier, code_challenge
+
+
+def _generate_auth_url(code_challenge: str, state: str) -> str:
+    """Generate the OAuth authorization URL."""
+    return (
+        f"{AUTH_AUTHORIZE_URL}"
+        f"?client_id={AUTH_CLIENT_ID}"
+        f"&audience={AUTH_AUDIENCE}"
+        f"&redirect_uri={REDIRECT_URI}"
+        f"&scope={AUTH_SCOPE.replace(' ', '%20')}"
+        f"&response_type=code"
+        f"&code_challenge={code_challenge}"
+        f"&code_challenge_method=S256"
+        f"&state={state}"
+        f"&prompt=login"
+    )
+
+
+def _extract_code_from_input(user_input: str) -> str | None:
+    """Extract authorization code from user input (URL or just code)."""
+    user_input = user_input.strip()
+
+    # If it looks like a URL, try to extract the code parameter
+    if user_input.startswith("com.eon-energia") or "code=" in user_input:
+        # Try to parse as URL
+        try:
+            parsed = urlparse(user_input)
+            query_params = parse_qs(parsed.query)
+            if "code" in query_params:
+                return query_params["code"][0]
+        except Exception:
+            pass
+
+        # Try regex as fallback
+        match = re.search(r"code=([^&]+)", user_input)
+        if match:
+            return match.group(1)
+
+    # Return as-is if it doesn't look like a URL (assume it's just the code)
+    return user_input if user_input else None
+
+
+async def _exchange_code_for_tokens(code: str, code_verifier: str) -> dict[str, Any]:
+    """Exchange authorization code for tokens."""
+    import aiohttp
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            AUTH_TOKEN_URL,
+            json={
+                "grant_type": "authorization_code",
+                "client_id": AUTH_CLIENT_ID,
+                "code": code,
+                "code_verifier": code_verifier,
+                "redirect_uri": REDIRECT_URI,
+            },
+            headers={"Content-Type": "application/json"},
+        ) as response:
+            if response.status != 200:
+                text = await response.text()
+                _LOGGER.error("Token exchange failed: %s - %s", response.status, text[:500])
+                raise EONEnergiaAuthError(f"Token exchange failed: {text[:200]}")
+            return await response.json()
 
 
 class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -42,6 +130,10 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
         self._pods: list[dict[str, Any]] = []
         self._selected_pod: str | None = None
         self._reconfig_entry: ConfigEntry | None = None
+        # OAuth PKCE state
+        self._code_verifier: str | None = None
+        self._state: str | None = None
+        self._auth_url: str | None = None
 
     @staticmethod
     @callback
@@ -49,80 +141,79 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
         """Get the options flow for this handler."""
         return EONEnergiaOptionsFlow()
 
+    def _init_oauth(self) -> None:
+        """Initialize OAuth parameters if not already done."""
+        if self._code_verifier is None:
+            self._code_verifier, code_challenge = _generate_pkce_pair()
+            self._state = secrets.token_urlsafe(32)
+            self._auth_url = _generate_auth_url(code_challenge, self._state)
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle the initial step - enter refresh token."""
+        """Handle the initial step - show login instructions and URL."""
         errors: dict[str, str] = {}
 
+        # Generate PKCE parameters on first load
+        self._init_oauth()
+
         if user_input is not None:
-            refresh_token = user_input[CONF_REFRESH_TOKEN].strip()
+            callback_input = user_input.get("callback_url", "").strip()
 
-            # Exchange refresh token for access token
-            # We immediately rotate the token to ensure the stored token is unique
-            # and won't conflict with any token still in use in the user's browser
-            api = EONEnergiaApi(
-                access_token="",  # Will be populated by refresh
-                refresh_token=refresh_token,
-            )
-            try:
-                # Try to refresh to get a valid access token and rotate the refresh token
-                _LOGGER.debug("Attempting to exchange refresh token for new tokens")
-                if not await api.refresh_access_token():
-                    errors["base"] = "invalid_refresh_token"
+            if not callback_input:
+                errors["base"] = "no_code"
+            else:
+                # Extract code from URL or use as-is
+                auth_code = _extract_code_from_input(callback_input)
+
+                if not auth_code:
+                    errors["base"] = "no_code"
                 else:
-                    # Verify we got a rotated refresh token
-                    if api.refresh_token == refresh_token:
-                        _LOGGER.warning(
-                            "Auth server did not rotate refresh token - "
-                            "this may cause issues if the same token is used elsewhere"
+                    # Exchange code for tokens
+                    try:
+                        tokens = await _exchange_code_for_tokens(auth_code, self._code_verifier)
+                        self._access_token = tokens["access_token"]
+                        self._refresh_token = tokens.get("refresh_token")
+
+                        # Now fetch PODs
+                        api = EONEnergiaApi(
+                            access_token=self._access_token,
+                            refresh_token=self._refresh_token,
                         )
-                    else:
-                        _LOGGER.debug(
-                            "Refresh token successfully rotated - storing new token"
-                        )
+                        try:
+                            pods = await api.get_points_of_delivery()
+                            if not pods:
+                                errors["base"] = "no_pods"
+                            else:
+                                self._pods = pods
+                                if len(pods) == 1:
+                                    self._selected_pod = self._extract_pod_code(pods[0])
+                                    return await self.async_step_select_tariff()
+                                return await self.async_step_select_pod()
+                        finally:
+                            await api.close()
 
-                    # Now fetch PODs with the new access token
-                    _LOGGER.debug("Fetching PODs with refreshed token")
-                    pods = await api.get_points_of_delivery()
-                    _LOGGER.debug("Received %d PODs", len(pods) if pods else 0)
-
-                    if not pods:
-                        errors["base"] = "no_pods"
-                    else:
-                        self._access_token = api.access_token
-                        # Store the rotated refresh token (not the user-provided one)
-                        self._refresh_token = api.refresh_token
-                        self._pods = pods
-
-                        # If only one POD, use it directly and go to tariff selection
-                        if len(pods) == 1:
-                            self._selected_pod = self._extract_pod_code(pods[0])
-                            return await self.async_step_select_tariff()
-
-                        # Multiple PODs - let user choose
-                        return await self.async_step_select_pod()
-
-            except EONEnergiaAuthError as err:
-                _LOGGER.error("Authentication error: %s", err)
-                errors["base"] = "invalid_auth"
-            except EONEnergiaApiError as err:
-                _LOGGER.error("API error: %s", err)
-                errors["base"] = "cannot_connect"
-            except Exception as err:
-                _LOGGER.exception("Unexpected error during setup: %s", err)
-                errors["base"] = "cannot_connect"
-            finally:
-                await api.close()
+                    except EONEnergiaAuthError as err:
+                        _LOGGER.error("Token exchange failed: %s", err)
+                        errors["base"] = "invalid_auth"
+                    except EONEnergiaApiError as err:
+                        _LOGGER.error("API error: %s", err)
+                        errors["base"] = "cannot_connect"
+                    except Exception as err:
+                        _LOGGER.exception("Unexpected error: %s", err)
+                        errors["base"] = "cannot_connect"
 
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_REFRESH_TOKEN): str,
+                    vol.Required("callback_url"): str,
                 }
             ),
             errors=errors,
+            description_placeholders={
+                "auth_url": self._auth_url,
+            },
         )
 
     async def async_step_select_pod(
@@ -234,65 +325,70 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_reconfigure_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle reconfiguration confirmation."""
+        """Handle reconfiguration - OAuth login to update credentials."""
         errors: dict[str, str] = {}
 
+        # Generate PKCE parameters on first load
+        self._init_oauth()
+
+        current_pod = self._reconfig_entry.data.get(CONF_POD, "Unknown")
+        current_tariff = self._reconfig_entry.data.get(CONF_TARIFF_TYPE, TARIFF_MULTIORARIA)
+
         if user_input is not None:
-            refresh_token = user_input[CONF_REFRESH_TOKEN].strip()
-            tariff_type = user_input[CONF_TARIFF_TYPE]
+            callback_input = user_input.get("callback_url", "").strip()
+            tariff_type = user_input.get(CONF_TARIFF_TYPE, current_tariff)
 
-            # Validate and rotate the refresh token
-            # This ensures we store a unique token that won't conflict with the browser
-            api = EONEnergiaApi(
-                access_token="",
-                refresh_token=refresh_token,
-            )
-            try:
-                if not await api.refresh_access_token():
-                    errors["base"] = "invalid_refresh_token"
+            if not callback_input:
+                errors["base"] = "no_code"
+            else:
+                # Extract code from URL or use as-is
+                auth_code = _extract_code_from_input(callback_input)
+
+                if not auth_code:
+                    errors["base"] = "no_code"
                 else:
-                    # Log token rotation status
-                    if api.refresh_token != refresh_token:
-                        _LOGGER.debug("Refresh token successfully rotated during reconfigure")
+                    # Exchange code for tokens
+                    try:
+                        tokens = await _exchange_code_for_tokens(auth_code, self._code_verifier)
+                        access_token = tokens["access_token"]
+                        refresh_token = tokens.get("refresh_token")
 
-                    pods = await api.get_points_of_delivery()
+                        # Verify the POD is still accessible
+                        api = EONEnergiaApi(
+                            access_token=access_token,
+                            refresh_token=refresh_token,
+                        )
+                        try:
+                            pods = await api.get_points_of_delivery()
+                            if not pods:
+                                errors["base"] = "no_pods"
+                            else:
+                                pod_codes = [self._extract_pod_code(pod) for pod in pods]
+                                if current_pod not in pod_codes:
+                                    errors["base"] = "pod_not_found"
+                                else:
+                                    # Update the config entry
+                                    return self.async_update_reload_and_abort(
+                                        self._reconfig_entry,
+                                        data={
+                                            CONF_ACCESS_TOKEN: access_token,
+                                            CONF_REFRESH_TOKEN: refresh_token,
+                                            CONF_POD: current_pod,
+                                            CONF_TARIFF_TYPE: tariff_type,
+                                        },
+                                    )
+                        finally:
+                            await api.close()
 
-                    if not pods:
-                        errors["base"] = "no_pods"
-                    else:
-                        # Verify the configured POD is still accessible
-                        pod_codes = [self._extract_pod_code(pod) for pod in pods]
-                        current_pod = self._reconfig_entry.data[CONF_POD]
-
-                        if current_pod not in pod_codes:
-                            errors["base"] = "pod_not_found"
-                        else:
-                            # Update the config entry with rotated token
-                            return self.async_update_reload_and_abort(
-                                self._reconfig_entry,
-                                data={
-                                    CONF_ACCESS_TOKEN: api.access_token,
-                                    CONF_REFRESH_TOKEN: api.refresh_token,
-                                    CONF_POD: current_pod,
-                                    CONF_TARIFF_TYPE: tariff_type,
-                                },
-                            )
-
-            except EONEnergiaAuthError:
-                errors["base"] = "invalid_auth"
-            except EONEnergiaApiError:
-                errors["base"] = "cannot_connect"
-            except Exception:
-                _LOGGER.exception("Unexpected error during reconfiguration")
-                errors["base"] = "cannot_connect"
-            finally:
-                await api.close()
-
-        # Get current values for defaults
-        current_refresh_token = self._reconfig_entry.data.get(CONF_REFRESH_TOKEN, "")
-        current_tariff = self._reconfig_entry.data.get(
-            CONF_TARIFF_TYPE, TARIFF_MULTIORARIA
-        )
+                    except EONEnergiaAuthError as err:
+                        _LOGGER.error("Token exchange failed: %s", err)
+                        errors["base"] = "invalid_auth"
+                    except EONEnergiaApiError as err:
+                        _LOGGER.error("API error: %s", err)
+                        errors["base"] = "cannot_connect"
+                    except Exception as err:
+                        _LOGGER.exception("Unexpected error: %s", err)
+                        errors["base"] = "cannot_connect"
 
         tariff_options = {
             TARIFF_MONORARIA: "Monoraria (tariffa unica)",
@@ -303,7 +399,7 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="reconfigure_confirm",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_REFRESH_TOKEN, default=current_refresh_token): str,
+                    vol.Required("callback_url"): str,
                     vol.Required(CONF_TARIFF_TYPE, default=current_tariff): vol.In(
                         tariff_options
                     ),
@@ -311,7 +407,8 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
             errors=errors,
             description_placeholders={
-                "pod": self._reconfig_entry.data.get(CONF_POD, "Unknown"),
+                "auth_url": self._auth_url,
+                "pod": current_pod,
             },
         )
 
@@ -319,68 +416,40 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
 class EONEnergiaOptionsFlow(OptionsFlow):
     """Handle EON Energia options."""
 
+    def __init__(self) -> None:
+        """Initialize the options flow."""
+        self._code_verifier: str | None = None
+        self._state: str | None = None
+        self._auth_url: str | None = None
+
+    def _init_oauth(self) -> None:
+        """Initialize OAuth parameters if not already done."""
+        if self._code_verifier is None:
+            self._code_verifier, code_challenge = _generate_pkce_pair()
+            self._state = secrets.token_urlsafe(32)
+            self._auth_url = _generate_auth_url(code_challenge, self._state)
+
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Manage the options."""
+        """Manage the options - OAuth login to update credentials."""
         errors: dict[str, str] = {}
 
+        # Generate PKCE parameters on first load
+        self._init_oauth()
+
+        current_pod = self.config_entry.data.get(CONF_POD, "Unknown")
+        current_tariff = self.config_entry.data.get(CONF_TARIFF_TYPE, TARIFF_MULTIORARIA)
+
         if user_input is not None:
-            refresh_token = user_input[CONF_REFRESH_TOKEN].strip()
-            tariff_type = user_input[CONF_TARIFF_TYPE]
+            callback_input = user_input.get("callback_url", "").strip()
+            tariff_type = user_input.get(CONF_TARIFF_TYPE, current_tariff)
 
-            # Validate the token if it changed
-            current_refresh_token = self.config_entry.data.get(CONF_REFRESH_TOKEN, "")
-
-            new_access_token = self.config_entry.data.get(CONF_ACCESS_TOKEN, "")
-            new_refresh_token = refresh_token
-
-            if refresh_token != current_refresh_token:
-                # Validate and rotate the new refresh token
-                api = EONEnergiaApi(
-                    access_token="",
-                    refresh_token=refresh_token,
-                )
-                try:
-                    if not await api.refresh_access_token():
-                        errors["base"] = "invalid_refresh_token"
-                    else:
-                        # Log token rotation status
-                        if api.refresh_token != refresh_token:
-                            _LOGGER.debug("Refresh token successfully rotated during options update")
-
-                        pods = await api.get_points_of_delivery()
-
-                        if not pods:
-                            errors["base"] = "no_pods"
-                        else:
-                            # Verify the configured POD is still accessible
-                            pod_codes = [self._extract_pod_code(pod) for pod in pods]
-                            current_pod = self.config_entry.data[CONF_POD]
-
-                            if current_pod not in pod_codes:
-                                errors["base"] = "pod_not_found"
-                            else:
-                                new_access_token = api.access_token
-                                # Store rotated token
-                                new_refresh_token = api.refresh_token
-
-                except EONEnergiaAuthError:
-                    errors["base"] = "invalid_auth"
-                except EONEnergiaApiError:
-                    errors["base"] = "cannot_connect"
-                except Exception:
-                    _LOGGER.exception("Unexpected error during options update")
-                    errors["base"] = "cannot_connect"
-                finally:
-                    await api.close()
-
-            if not errors:
-                # Update both data and options
+            # If no callback URL provided, just update tariff
+            if not callback_input:
+                # Only update tariff without re-authenticating
                 new_data = {
                     **self.config_entry.data,
-                    CONF_ACCESS_TOKEN: new_access_token,
-                    CONF_REFRESH_TOKEN: new_refresh_token,
                     CONF_TARIFF_TYPE: tariff_type,
                 }
                 self.hass.config_entries.async_update_entry(
@@ -389,11 +458,56 @@ class EONEnergiaOptionsFlow(OptionsFlow):
                 )
                 return self.async_create_entry(title="", data={})
 
-        # Get current values
-        current_refresh_token = self.config_entry.data.get(CONF_REFRESH_TOKEN, "")
-        current_tariff = self.config_entry.data.get(
-            CONF_TARIFF_TYPE, TARIFF_MULTIORARIA
-        )
+            # Extract code from URL or use as-is
+            auth_code = _extract_code_from_input(callback_input)
+
+            if not auth_code:
+                errors["base"] = "no_code"
+            else:
+                # Exchange code for tokens
+                try:
+                    tokens = await _exchange_code_for_tokens(auth_code, self._code_verifier)
+                    access_token = tokens["access_token"]
+                    refresh_token = tokens.get("refresh_token")
+
+                    # Verify the POD is still accessible
+                    api = EONEnergiaApi(
+                        access_token=access_token,
+                        refresh_token=refresh_token,
+                    )
+                    try:
+                        pods = await api.get_points_of_delivery()
+                        if not pods:
+                            errors["base"] = "no_pods"
+                        else:
+                            pod_codes = [self._extract_pod_code(pod) for pod in pods]
+                            if current_pod not in pod_codes:
+                                errors["base"] = "pod_not_found"
+                            else:
+                                # Update the config entry
+                                new_data = {
+                                    **self.config_entry.data,
+                                    CONF_ACCESS_TOKEN: access_token,
+                                    CONF_REFRESH_TOKEN: refresh_token,
+                                    CONF_TARIFF_TYPE: tariff_type,
+                                }
+                                self.hass.config_entries.async_update_entry(
+                                    self.config_entry,
+                                    data=new_data,
+                                )
+                                return self.async_create_entry(title="", data={})
+                    finally:
+                        await api.close()
+
+                except EONEnergiaAuthError as err:
+                    _LOGGER.error("Token exchange failed: %s", err)
+                    errors["base"] = "invalid_auth"
+                except EONEnergiaApiError as err:
+                    _LOGGER.error("API error: %s", err)
+                    errors["base"] = "cannot_connect"
+                except Exception as err:
+                    _LOGGER.exception("Unexpected error: %s", err)
+                    errors["base"] = "cannot_connect"
 
         tariff_options = {
             TARIFF_MONORARIA: "Monoraria (tariffa unica)",
@@ -404,13 +518,17 @@ class EONEnergiaOptionsFlow(OptionsFlow):
             step_id="init",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_REFRESH_TOKEN, default=current_refresh_token): str,
+                    vol.Optional("callback_url"): str,
                     vol.Required(CONF_TARIFF_TYPE, default=current_tariff): vol.In(
                         tariff_options
                     ),
                 }
             ),
             errors=errors,
+            description_placeholders={
+                "auth_url": self._auth_url,
+                "pod": current_pod,
+            },
         )
 
     def _extract_pod_code(self, pod: dict[str, Any]) -> str:
