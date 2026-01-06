@@ -46,27 +46,25 @@ A custom Home Assistant integration for monitoring electricity consumption from 
 
 1. Go to **Settings** → **Devices & Services** → **Add Integration**
 2. Search for "EON Energia"
-3. Enter your refresh token (see below how to obtain it)
+3. Follow the OAuth login flow (see below)
 4. Select your electricity meter (POD) if you have multiple
 5. Choose your tariff type (Monoraria or Bioraria/Multioraria)
 
-## Obtaining the Refresh Token
+## Authentication
 
-The integration uses OAuth refresh tokens for authentication. The refresh token allows the integration to automatically renew access tokens, so you won't need to manually update credentials.
+The integration uses OAuth authentication with the EON Energia mobile app's login flow. Here's how it works:
 
-**How to obtain it:**
+1. When adding the integration, you'll see a login URL - **copy it and open it in a new browser tab**
+2. Log in with your EON Energia credentials
+3. After login, the browser will try to open a mobile app and fail - **this is expected!**
+4. Open your browser's **Developer Tools** (press F12 or Cmd+Option+I on Mac)
+5. In the **Console** tab, look for an error message like: `Failed to launch 'com.eon-energia.eon.auth0://...'`
+6. **Right-click** on the URL and select "Copy link address" to copy the entire URL
+7. Paste it back into the Home Assistant configuration form
 
-1. Open your browser and go to [myeon.eon-energia.com](https://myeon.eon-energia.com)
-2. Log in with your credentials
-3. Open Developer Tools (F12 or right-click → Inspect)
-4. Go to the **Network** tab
-5. Refresh the page
-6. Look for a request to `https://auth.eon-energia.com/oauth/token`
-7. Click on it and check the **Response** tab
-8. Find the response with `scope: openid profile email offline_access`
-9. Copy the `refresh_token` value
+![Authentication Flow Screenshot](docs/auth-flow.png)
 
-> **Note**: The refresh token is long-lived and the integration will automatically handle token renewal. You should only need to update it if you log out of your EON account or revoke the token.
+> **Note**: The integration automatically handles token refresh. You should only need to re-authenticate if your token expires or is revoked.
 
 ## Sensors
 
@@ -234,11 +232,11 @@ This integration uses the EON Energia API:
 
 ### Token expired / Authentication errors
 
-The integration automatically refreshes access tokens using your refresh token. If you see persistent authentication errors:
+The integration automatically refreshes access tokens. If you see persistent authentication errors:
 
 1. Go to **Settings** → **Devices & Services** → **EON Energia**
-2. Click **Configure** to update your refresh token
-3. Obtain a new refresh token from the web interface (see instructions above)
+2. Click **Configure** (or use the three-dot menu → Reconfigure)
+3. Follow the OAuth login flow again to get new credentials
 
 ### No data
 
@@ -260,7 +258,11 @@ Check the Token Status sensor's `last_error` attribute for details. Common cause
 
 - Network connectivity issues
 - EON Energia API temporarily unavailable
-- Refresh token has been revoked (re-login and get a new one)
+- Token has been revoked (use Configure/Reconfigure to re-authenticate)
+
+## Limitations
+
+- **Electricity only**: This integration currently supports electricity meters (POD) only. Gas meter (PDR) support is not implemented as I don't have a gas contract to test with. If you have an EON gas contract and would like to help add support, please open an issue on GitHub.
 
 ## Contributing
 
