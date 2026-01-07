@@ -3,9 +3,10 @@
     "step": {
       "user": {
         "title": "EON Energia Login",
-        "description": "To connect your EON Energia account:\n\n1. **Copy** this URL and open it in a new browser tab:\n\n`{auth_url}`\n\n2. Log in with your EON Energia credentials\n3. After login, the browser will try to open an app and show an error - **this is expected!**\n4. Open your browser's **Developer Tools** (press F12 or Cmd+Option+I on Mac)\n5. Look in the **Console** tab for an error like: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Right-click** on the URL and select \"Copy link address\" to copy the entire URL, then paste it below",
+        "description": "Enter your EON Energia account credentials.",
         "data": {
-          "callback_url": "Callback URL"
+          "username": "Email",
+          "password": "Password"
         }
       },
       "select_pod": {
@@ -24,20 +25,49 @@
       },
       "reconfigure_confirm": {
         "title": "Reconfigure EON Energia",
-        "description": "Update credentials for POD {pod}.\n\n1. **Copy** this URL and open it in a new browser tab:\n\n`{auth_url}`\n\n2. Log in with your EON Energia credentials\n3. After login, the browser will try to open an app and show an error - **this is expected!**\n4. Open your browser's **Developer Tools** (press F12 or Cmd+Option+I on Mac)\n5. Look in the **Console** tab for an error like: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Right-click** on the URL and select \"Copy link address\" to copy the entire URL, then paste it below",
+        "description": "Update credentials for POD {pod}.",
         "data": {
-          "callback_url": "Callback URL",
+          "username": "Email",
+          "password": "Password",
           "tariff_type": "Tariff Type"
+        }
+      },
+      "mfa": {
+        "title": "SMS Verification",
+        "description": "Enter the verification code sent to your phone via SMS.",
+        "data": {
+          "mfa_code": "Verification Code"
+        }
+      },
+      "reconfigure_mfa": {
+        "title": "SMS Verification",
+        "description": "Enter the verification code sent to your phone via SMS.",
+        "data": {
+          "mfa_code": "Verification Code"
+        }
+      },
+      "auth_fallback": {
+        "title": "Manual Authentication",
+        "description": "Automatic login failed. You can try the manual authentication method:\n\n1. **Copy** this URL and open it in a new browser tab:\n\n`{auth_url}`\n\n2. Log in with your EON Energia credentials\n3. After login, the browser will try to open an app and show an error - **this is expected!**\n4. Open your browser's **Developer Tools** (press F12 or Cmd+Option+I on Mac)\n5. Look in the **Console** tab for an error like: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Right-click** on the URL and select \"Copy link address\" to copy the entire URL, then paste it below",
+        "data": {
+          "callback_url": "Callback URL"
+        }
+      },
+      "reconfigure_fallback": {
+        "title": "Manual Authentication",
+        "description": "Automatic login failed for POD {pod}. You can try the manual authentication method:\n\n1. **Copy** this URL and open it in a new browser tab:\n\n`{auth_url}`\n\n2. Log in with your EON Energia credentials\n3. After login, the browser will try to open an app and show an error - **this is expected!**\n4. Open your browser's **Developer Tools** (press F12 or Cmd+Option+I on Mac)\n5. Look in the **Console** tab for an error like: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Right-click** on the URL and select \"Copy link address\" to copy the entire URL, then paste it below",
+        "data": {
+          "callback_url": "Callback URL"
         }
       }
     },
     "error": {
-      "invalid_auth": "Invalid credentials or authorization code. The code may have expired - please try the login process again.",
+      "invalid_auth": "Invalid username or password.",
       "cannot_connect": "Failed to connect to EON Energia API.",
       "no_pods": "No electricity meters (PODs) found in your account.",
-      "no_code": "Please paste the callback URL from the browser console error message.",
-      "invalid_refresh_token": "Invalid or expired refresh token.",
-      "pod_not_found": "The configured POD is no longer accessible with this account."
+      "pod_not_found": "The configured POD is no longer accessible with this account.",
+      "invalid_mfa_code": "Invalid verification code. Please try again.",
+      "invalid_callback_url": "Invalid callback URL. Make sure to copy the entire URL from your browser."
     },
     "abort": {
       "already_configured": "This meter is already configured.",
@@ -48,19 +78,84 @@
     "step": {
       "init": {
         "title": "EON Energia Options",
-        "description": "Update settings for POD {pod}.\n\nTo change your tariff type only, just select the new tariff below.\n\nTo re-authenticate (if your token expired):\n1. **Copy** this URL and open it in a new browser tab:\n\n`{auth_url}`\n\n2. Log in with your EON Energia credentials\n3. After login, the browser will try to open an app and show an error - **this is expected!**\n4. Open your browser's **Developer Tools** (press F12 or Cmd+Option+I on Mac)\n5. Look in the **Console** tab for an error like: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Right-click** on the URL and select \"Copy link address\" to copy the entire URL, then paste it below",
+        "description": "Update settings for POD {pod}.\n\nTo change your tariff type only, just select the new tariff below.\n\nTo log in again, enter your credentials.",
         "data": {
-          "callback_url": "Callback URL (optional - only if re-authenticating)",
+          "username": "Email (optional)",
+          "password": "Password (optional)",
           "tariff_type": "Tariff Type"
+        }
+      },
+      "mfa": {
+        "title": "SMS Verification",
+        "description": "Enter the verification code sent to your phone via SMS.",
+        "data": {
+          "mfa_code": "Verification Code"
+        }
+      },
+      "auth_fallback": {
+        "title": "Manual Authentication",
+        "description": "Automatic login failed for POD {pod}. You can try the manual authentication method:\n\n1. **Copy** this URL and open it in a new browser tab:\n\n`{auth_url}`\n\n2. Log in with your EON Energia credentials\n3. After login, the browser will try to open an app and show an error - **this is expected!**\n4. Open your browser's **Developer Tools** (press F12 or Cmd+Option+I on Mac)\n5. Look in the **Console** tab for an error like: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Right-click** on the URL and select \"Copy link address\" to copy the entire URL, then paste it below",
+        "data": {
+          "callback_url": "Callback URL"
         }
       }
     },
     "error": {
-      "invalid_auth": "Invalid credentials.",
+      "invalid_auth": "Invalid username or password.",
       "cannot_connect": "Failed to connect to EON Energia API.",
       "no_pods": "No electricity meters (PODs) found in your account.",
-      "invalid_refresh_token": "Invalid or expired refresh token.",
-      "pod_not_found": "The configured POD is no longer accessible with this account."
+      "pod_not_found": "The configured POD is no longer accessible with this account.",
+      "invalid_mfa_code": "Invalid verification code. Please try again.",
+      "invalid_callback_url": "Invalid callback URL. Make sure to copy the entire URL from your browser."
+    }
+  },
+  "services": {
+    "import_statistics": {
+      "name": "Import Statistics",
+      "description": "Import historical energy consumption data into Home Assistant statistics for use in the Energy Dashboard. This can take several minutes depending on the number of days to import.",
+      "fields": {
+        "days": {
+          "name": "Days",
+          "description": "Number of days of historical data to import (1-365)."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "daily_consumption": {
+        "name": "Daily Consumption"
+      },
+      "last_reading": {
+        "name": "Last Hourly Reading"
+      },
+      "token_status": {
+        "name": "Connection Status"
+      },
+      "cumulative_energy": {
+        "name": "Cumulative Energy"
+      },
+      "cumulative_energy_f1": {
+        "name": "Cumulative Energy Peak (F1)"
+      },
+      "cumulative_energy_f2": {
+        "name": "Cumulative Energy Mid-peak (F2)"
+      },
+      "cumulative_energy_f3": {
+        "name": "Cumulative Energy Off-peak (F3)"
+      },
+      "latest_invoice": {
+        "name": "Latest Invoice"
+      },
+      "invoice_payment_status": {
+        "name": "Invoice Payment Status"
+      },
+      "unpaid_invoices": {
+        "name": "Unpaid Invoices"
+      },
+      "total_invoiced": {
+        "name": "Total Invoiced"
+      }
     }
   }
 }
