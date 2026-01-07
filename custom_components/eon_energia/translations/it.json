@@ -3,9 +3,10 @@
     "step": {
       "user": {
         "title": "Login EON Energia",
-        "description": "Per collegare il tuo account EON Energia:\n\n1. **Copia** questo URL e aprilo in una nuova scheda del browser:\n\n`{auth_url}`\n\n2. Accedi con le tue credenziali EON Energia\n3. Dopo il login, il browser proverà ad aprire un'app e mostrerà un errore - **questo è normale!**\n4. Apri gli **Strumenti per sviluppatori** del browser (premi F12 o Cmd+Option+I su Mac)\n5. Cerca nella scheda **Console** un errore come: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Clicca col tasto destro** sull'URL e seleziona \"Copia indirizzo link\" per copiare l'intero URL, poi incollalo qui sotto",
+        "description": "Inserisci le credenziali del tuo account EON Energia.",
         "data": {
-          "callback_url": "URL di Callback"
+          "username": "Email",
+          "password": "Password"
         }
       },
       "select_pod": {
@@ -24,20 +25,49 @@
       },
       "reconfigure_confirm": {
         "title": "Riconfigura EON Energia",
-        "description": "Aggiorna le credenziali per il POD {pod}.\n\n1. **Copia** questo URL e aprilo in una nuova scheda del browser:\n\n`{auth_url}`\n\n2. Accedi con le tue credenziali EON Energia\n3. Dopo il login, il browser proverà ad aprire un'app e mostrerà un errore - **questo è normale!**\n4. Apri gli **Strumenti per sviluppatori** del browser (premi F12 o Cmd+Option+I su Mac)\n5. Cerca nella scheda **Console** un errore come: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Clicca col tasto destro** sull'URL e seleziona \"Copia indirizzo link\" per copiare l'intero URL, poi incollalo qui sotto",
+        "description": "Aggiorna le credenziali per il POD {pod}.",
         "data": {
-          "callback_url": "URL di Callback",
+          "username": "Email",
+          "password": "Password",
           "tariff_type": "Tipo Tariffa"
+        }
+      },
+      "mfa": {
+        "title": "Verifica SMS",
+        "description": "Inserisci il codice di verifica ricevuto via SMS.",
+        "data": {
+          "mfa_code": "Codice di Verifica"
+        }
+      },
+      "reconfigure_mfa": {
+        "title": "Verifica SMS",
+        "description": "Inserisci il codice di verifica ricevuto via SMS.",
+        "data": {
+          "mfa_code": "Codice di Verifica"
+        }
+      },
+      "auth_fallback": {
+        "title": "Autenticazione Manuale",
+        "description": "Il login automatico non è riuscito. Puoi provare il metodo di autenticazione manuale:\n\n1. **Copia** questo URL e aprilo in una nuova scheda del browser:\n\n`{auth_url}`\n\n2. Accedi con le tue credenziali EON Energia\n3. Dopo il login, il browser proverà ad aprire un'app e mostrerà un errore - **questo è normale!**\n4. Apri gli **Strumenti per sviluppatori** del browser (premi F12 o Cmd+Option+I su Mac)\n5. Cerca nella scheda **Console** un errore come: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Clicca col tasto destro** sull'URL e seleziona \"Copia indirizzo link\" per copiare l'intero URL, poi incollalo qui sotto",
+        "data": {
+          "callback_url": "URL di Callback"
+        }
+      },
+      "reconfigure_fallback": {
+        "title": "Autenticazione Manuale",
+        "description": "Il login automatico per il POD {pod} non è riuscito. Puoi provare il metodo di autenticazione manuale:\n\n1. **Copia** questo URL e aprilo in una nuova scheda del browser:\n\n`{auth_url}`\n\n2. Accedi con le tue credenziali EON Energia\n3. Dopo il login, il browser proverà ad aprire un'app e mostrerà un errore - **questo è normale!**\n4. Apri gli **Strumenti per sviluppatori** del browser (premi F12 o Cmd+Option+I su Mac)\n5. Cerca nella scheda **Console** un errore come: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Clicca col tasto destro** sull'URL e seleziona \"Copia indirizzo link\" per copiare l'intero URL, poi incollalo qui sotto",
+        "data": {
+          "callback_url": "URL di Callback"
         }
       }
     },
     "error": {
-      "invalid_auth": "Credenziali o codice di autorizzazione non valido. Il codice potrebbe essere scaduto - riprova il processo di login.",
-      "invalid_refresh_token": "Refresh token non valido o scaduto.",
+      "invalid_auth": "Email o password non validi.",
       "cannot_connect": "Impossibile connettersi all'API EON Energia.",
       "no_pods": "Nessun contatore elettrico (POD) trovato nel tuo account.",
-      "no_code": "Incolla l'URL di callback dal messaggio di errore nella console del browser.",
-      "pod_not_found": "Il POD configurato non è più accessibile con questo account."
+      "pod_not_found": "Il POD configurato non è più accessibile con questo account.",
+      "invalid_mfa_code": "Codice di verifica non valido. Riprova.",
+      "invalid_callback_url": "URL di callback non valido. Assicurati di copiare l'intero URL dal browser."
     },
     "abort": {
       "already_configured": "Questo contatore è già configurato.",
@@ -48,19 +78,35 @@
     "step": {
       "init": {
         "title": "Opzioni EON Energia",
-        "description": "Aggiorna le impostazioni per il POD {pod}.\n\nPer cambiare solo il tipo di tariffa, seleziona la nuova tariffa qui sotto.\n\nPer ri-autenticarti (se il token è scaduto):\n1. **Copia** questo URL e aprilo in una nuova scheda del browser:\n\n`{auth_url}`\n\n2. Accedi con le tue credenziali EON Energia\n3. Dopo il login, il browser proverà ad aprire un'app e mostrerà un errore - **questo è normale!**\n4. Apri gli **Strumenti per sviluppatori** del browser (premi F12 o Cmd+Option+I su Mac)\n5. Cerca nella scheda **Console** un errore come: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Clicca col tasto destro** sull'URL e seleziona \"Copia indirizzo link\" per copiare l'intero URL, poi incollalo qui sotto",
+        "description": "Aggiorna le impostazioni per il POD {pod}.\n\nPer cambiare solo il tipo di tariffa, seleziona la nuova tariffa qui sotto.\n\nPer accedere di nuovo, inserisci le tue credenziali.",
         "data": {
-          "callback_url": "URL di Callback (opzionale - solo per ri-autenticazione)",
+          "username": "Email (opzionale)",
+          "password": "Password (opzionale)",
           "tariff_type": "Tipo Tariffa"
+        }
+      },
+      "mfa": {
+        "title": "Verifica SMS",
+        "description": "Inserisci il codice di verifica ricevuto via SMS.",
+        "data": {
+          "mfa_code": "Codice di Verifica"
+        }
+      },
+      "auth_fallback": {
+        "title": "Autenticazione Manuale",
+        "description": "Il login automatico per il POD {pod} non è riuscito. Puoi provare il metodo di autenticazione manuale:\n\n1. **Copia** questo URL e aprilo in una nuova scheda del browser:\n\n`{auth_url}`\n\n2. Accedi con le tue credenziali EON Energia\n3. Dopo il login, il browser proverà ad aprire un'app e mostrerà un errore - **questo è normale!**\n4. Apri gli **Strumenti per sviluppatori** del browser (premi F12 o Cmd+Option+I su Mac)\n5. Cerca nella scheda **Console** un errore come: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Clicca col tasto destro** sull'URL e seleziona \"Copia indirizzo link\" per copiare l'intero URL, poi incollalo qui sotto",
+        "data": {
+          "callback_url": "URL di Callback"
         }
       }
     },
     "error": {
-      "invalid_auth": "Credenziali non valide.",
-      "invalid_refresh_token": "Refresh token non valido o scaduto.",
+      "invalid_auth": "Email o password non validi.",
       "cannot_connect": "Impossibile connettersi all'API EON Energia.",
       "no_pods": "Nessun contatore elettrico (POD) trovato nel tuo account.",
-      "pod_not_found": "Il POD configurato non è più accessibile con questo account."
+      "pod_not_found": "Il POD configurato non è più accessibile con questo account.",
+      "invalid_mfa_code": "Codice di verifica non valido. Riprova.",
+      "invalid_callback_url": "URL di callback non valido. Assicurati di copiare l'intero URL dal browser."
     }
   },
   "services": {
@@ -84,7 +130,7 @@
         "name": "Ultima Lettura Oraria"
       },
       "token_status": {
-        "name": "Stato Token"
+        "name": "Stato Connessione"
       },
       "cumulative_energy": {
         "name": "Energia Cumulativa"

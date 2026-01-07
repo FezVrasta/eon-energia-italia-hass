@@ -19,7 +19,7 @@ A custom Home Assistant integration for monitoring electricity consumption from 
 - **Tariff Support**: Choose between Monoraria (single rate) or Bioraria/Multioraria (F1, F2, F3)
 - **Invoice Tracking**: Monitor invoices, payment status, and costs
 - **Cost Statistics**: Automatic cost calculation from average €/kWh (calculated from invoices)
-- **Token Status Sensor**: Monitor the health of your API connection
+- **Connection Status Sensor**: Monitor the health of your API connection
 - **Italian and English translations**
 
 ![EON Energia Integration Screenshot](docs/energy-dashboard.png)
@@ -46,25 +46,9 @@ A custom Home Assistant integration for monitoring electricity consumption from 
 
 1. Go to **Settings** → **Devices & Services** → **Add Integration**
 2. Search for "EON Energia"
-3. Follow the OAuth login flow (see below)
+3. Enter your EON Energia email and password
 4. Select your electricity meter (POD) if you have multiple
 5. Choose your tariff type (Monoraria or Bioraria/Multioraria)
-
-## Authentication
-
-The integration uses OAuth authentication with the EON Energia mobile app's login flow. Here's how it works:
-
-1. When adding the integration, you'll see a login URL - **copy it and open it in a new browser tab**
-2. Log in with your EON Energia credentials
-3. After login, the browser will try to open a mobile app and fail - **this is expected!**
-4. Open your browser's **Developer Tools** (press F12 or Cmd+Option+I on Mac)
-5. In the **Console** tab, look for an error message like: `Failed to launch 'com.eon-energia.eon.auth0://...'`
-6. **Right-click** on the URL and select "Copy link address" to copy the entire URL
-7. Paste it back into the Home Assistant configuration form
-
-![Authentication Flow Screenshot](docs/auth-flow.png)
-
-> **Note**: The integration automatically handles token refresh. You should only need to re-authenticate if your token expires or is revoked.
 
 ## Sensors
 
@@ -230,13 +214,13 @@ This integration uses the EON Energia API:
 
 ## Troubleshooting
 
-### Token expired / Authentication errors
+### Connection issues
 
-The integration automatically refreshes access tokens. If you see persistent authentication errors:
+If the **Connection Status** sensor shows errors or you're having trouble fetching data:
 
 1. Go to **Settings** → **Devices & Services** → **EON Energia**
 2. Click **Configure** (or use the three-dot menu → Reconfigure)
-3. Follow the OAuth login flow again to get new credentials
+3. Enter your EON Energia credentials again to reconnect
 
 ### No data
 
@@ -252,13 +236,13 @@ If the API returns empty data, the readings for that date haven't been processed
 2. Go to **Developer Tools** → **Statistics** and search for "eon" to verify the data was imported
 3. Add the external statistic (e.g., `eon_energia:{POD}_consumption`) to your Energy Dashboard
 
-### Token Status shows "invalid"
+### Connection Status shows "invalid"
 
-Check the Token Status sensor's `last_error` attribute for details. Common causes:
+Check the Connection Status sensor's `last_error` attribute for details. Common causes:
 
 - Network connectivity issues
 - EON Energia API temporarily unavailable
-- Token has been revoked (use Configure/Reconfigure to re-authenticate)
+- Session expired (use Configure/Reconfigure to log in again)
 
 ## Limitations
 
