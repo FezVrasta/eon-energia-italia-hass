@@ -8,7 +8,7 @@ A custom Home Assistant integration for monitoring electricity consumption from 
 
 ## Features
 
-- **Automatic Token Refresh**: Uses OAuth refresh tokens - no need to manually update credentials
+- **Simple Login**: Just enter your EON Energia email and password
 - **Automatic Statistics Import**: Hourly consumption data is automatically imported to HA statistics
 - **Energy Dashboard Ready**: Works directly with the Home Assistant Energy Dashboard
 - **Cumulative Energy Sensors**: Track total consumption with persistent state across restarts
