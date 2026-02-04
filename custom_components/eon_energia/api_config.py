@@ -165,8 +165,8 @@ def _extract_api_url_from_html(html: str) -> str | None:
     """Extract API base URL from HTML content.
 
     Looks for patterns like:
-    - "audience": "REDACTED_API_URL"
-    - api:{domain:"REDACTED_API_URL"
+    - "audience": "https://..."
+    - api:{domain:"https://..."
     """
     patterns = [
         r'"audience"\s*:\s*"(https://[^"]+)"',

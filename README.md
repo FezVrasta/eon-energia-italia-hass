@@ -206,7 +206,7 @@ To add EON Energia consumption to the Energy Dashboard:
 
 This integration uses the EON Energia API:
 
-- **Base URL**: `REDACTED_API_URL`
+- **Base URL**: Fetched dynamically from the EON website
 - **Consumption Endpoint**: `/DeeperConsumption/v1.0/ExtDailyConsumption`
 - **Invoices Endpoint**: `/scsi/invoices/v1.0/getInvoiceDvc`
 - **Consumption Update Interval**: Every 6 hours
