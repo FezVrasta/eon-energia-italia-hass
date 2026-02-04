@@ -9,6 +9,8 @@ from typing import Any
 
 import aiohttp
 
+from .api_config import get_api_config
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -42,19 +44,19 @@ def _extract_form_action(html: str, default_url: str) -> str:
 AUTH_DOMAIN = "https://auth.eon-energia.com"
 AUTH_CLIENT_ID = "vEZ41cyr2pOHux9EKoN8dDgGb7UZc7EB"  # iOS app client_id
 AUTH_REDIRECT_URI = "com.eon-energia.eon.auth0://auth.eon-energia.com/ios/com.eon-energia.eon/callback"
-AUTH_AUDIENCE = "REDACTED_API_URL"
 AUTH_SCOPE = "openid profile email offline_access"
 
 
-def build_authorization_url() -> str:
+async def build_authorization_url() -> str:
     """Build the authorization URL for manual OAuth flow."""
+    config = await get_api_config()
     params = {
         "os": "ios",
         "response_type": "code",
         "client_id": AUTH_CLIENT_ID,
         "redirect_uri": AUTH_REDIRECT_URI,
         "scope": AUTH_SCOPE,
-        "audience": AUTH_AUDIENCE,
+        "audience": config["base_url"],
     }
     return f"{AUTH_DOMAIN}/authorize?" + urllib.parse.urlencode(params)
 
@@ -112,6 +114,10 @@ class EONAuth0Client:
             "Referer": AUTH_DOMAIN + "/",
         }
 
+        # Get API config for audience
+        api_config = await get_api_config()
+        auth_audience = api_config["base_url"]
+
         # Create session with cookie jar to maintain cookies across requests
         jar = aiohttp.CookieJar()
         async with aiohttp.ClientSession(cookie_jar=jar) as session:
@@ -122,7 +128,7 @@ class EONAuth0Client:
                 "client_id": AUTH_CLIENT_ID,
                 "redirect_uri": AUTH_REDIRECT_URI,
                 "scope": AUTH_SCOPE,
-                "audience": AUTH_AUDIENCE,
+                "audience": auth_audience,
             }
             authorize_url = f"{AUTH_DOMAIN}/authorize?" + urllib.parse.urlencode(authorize_params)
 

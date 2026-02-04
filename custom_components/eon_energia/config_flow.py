@@ -235,7 +235,7 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                         errors["base"] = "cannot_connect"
 
         # Build authorization URL
-        auth_url = build_authorization_url()
+        auth_url = await build_authorization_url()
 
         return self.async_show_form(
             step_id="auth_fallback",
@@ -575,7 +575,7 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                         errors["base"] = "cannot_connect"
 
         # Build authorization URL
-        auth_url = build_authorization_url()
+        auth_url = await build_authorization_url()
 
         return self.async_show_form(
             step_id="reconfigure_fallback",
@@ -842,7 +842,7 @@ class EONEnergiaOptionsFlow(OptionsFlow):
                         errors["base"] = "cannot_connect"
 
         # Build authorization URL
-        auth_url = build_authorization_url()
+        auth_url = await build_authorization_url()
 
         return self.async_show_form(
             step_id="auth_fallback",

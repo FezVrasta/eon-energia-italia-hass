@@ -8,9 +8,8 @@ from typing import Any, Callable
 
 import aiohttp
 
+from .api_config import ApiConfigError, get_api_config
 from .const import (
-    API_BASE_URL,
-    API_SUBSCRIPTION_KEY,
     AUTH_CLIENT_ID,
     AUTH_TOKEN_URL,
     ENDPOINT_DAILY_CONSUMPTION,
@@ -58,6 +57,7 @@ class EONEnergiaApi:
         self._refresh_token = refresh_token
         self._token_callback = token_callback
         self._session: aiohttp.ClientSession | None = None
+        self._api_config: dict[str, str] | None = None
 
     @property
     def access_token(self) -> str:
@@ -69,13 +69,26 @@ class EONEnergiaApi:
         """Return the current refresh token."""
         return self._refresh_token
 
-    @property
-    def _headers(self) -> dict[str, str]:
+    async def _get_api_config(self) -> dict[str, str]:
+        """Get the API configuration, fetching if needed."""
+        if self._api_config is None:
+            session = await self._get_session()
+            try:
+                self._api_config = await get_api_config(session)
+            except ApiConfigError as err:
+                _LOGGER.error("Failed to get API configuration: %s", err)
+                raise EONEnergiaApiError(
+                    f"Failed to get API configuration: {err}"
+                ) from err
+        return self._api_config
+
+    async def _get_headers(self) -> dict[str, str]:
         """Return headers for API requests."""
+        config = await self._get_api_config()
         return {
             "Authorization": f"Bearer {self._access_token}",
             "Content-Type": "application/json",
-            "ocp-apim-subscription-key": API_SUBSCRIPTION_KEY,
+            "ocp-apim-subscription-key": config["subscription_key"],
         }
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -160,13 +173,15 @@ class EONEnergiaApi:
     ) -> dict[str, Any]:
         """Make an API request with automatic token refresh."""
         session = await self._get_session()
-        url = f"{API_BASE_URL}{endpoint}"
+        config = await self._get_api_config()
+        url = f"{config['base_url']}{endpoint}"
+        headers = await self._get_headers()
 
         try:
             async with session.request(
                 method,
                 url,
-                headers=self._headers,
+                headers=headers,
                 json=data if method == "POST" else None,
                 params=params,
             ) as response:
