@@ -15,9 +15,11 @@ import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
 
-# EON website URL
+# EON website URLs
 MYEON_BASE_URL = "https://myeon.eon-energia.com"
 MYEON_LOGIN_URL = f"{MYEON_BASE_URL}/it/login.html"
+# Direct config JS file - preferred source as it contains all config in one place
+MYEON_CONFIG_JS_URL = f"{MYEON_BASE_URL}/content/eon-scsi/it/login.scsiconfig.js"
 
 # Cache configuration (24 hours)
 CONFIG_CACHE_TTL = 86400
@@ -94,11 +96,18 @@ async def _fetch_api_config(
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "*/*",
             "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
         }
 
-        # Fetch login page to get API base URL and find JS files
+        # Try the direct config JS file first - it contains all config in one place
+        config = await _try_fetch_from_config_js(session, headers)
+        if config:
+            return config
+
+        _LOGGER.debug("Config JS not available, falling back to login page parsing")
+
+        # Fallback: Fetch login page to get API base URL and find JS files
         async with session.get(
             MYEON_LOGIN_URL, headers=headers, allow_redirects=True
         ) as response:
@@ -159,6 +168,76 @@ async def _fetch_api_config(
     finally:
         if close_session:
             await session.close()
+
+
+async def _try_fetch_from_config_js(
+    session: aiohttp.ClientSession,
+    headers: dict[str, str],
+) -> dict[str, str] | None:
+    """Try to fetch config from the dedicated scsiconfig.js file.
+
+    This file contains a clean JS object with all configuration values.
+    Returns None if the file is not accessible.
+    """
+    try:
+        async with session.get(MYEON_CONFIG_JS_URL, headers=headers) as response:
+            if response.status != 200:
+                _LOGGER.debug(
+                    "Config JS file not accessible: HTTP %s", response.status
+                )
+                return None
+
+            js_content = await response.text()
+
+        # Extract from the env object in the config file
+        # Format: "apicrm.url":"https://api-mmi.eon.it"
+        base_url = None
+        subscription_key = None
+
+        # Look for apicrm.url or api.url for the base URL
+        url_patterns = [
+            r'"apicrm\.url"\s*:\s*"([^"]+)"',
+            r'"api\.url"\s*:\s*"([^"]+)"',
+        ]
+        for pattern in url_patterns:
+            match = re.search(pattern, js_content)
+            if match:
+                # Handle escaped characters like \u002D for hyphen
+                url = match.group(1).encode().decode("unicode_escape")
+                # api.url might have /scsi suffix, we want the base
+                if url.endswith("/scsi"):
+                    url = url[:-5]
+                base_url = url
+                break
+
+        # Look for subscription.key or crm.apim.key
+        key_patterns = [
+            r'"subscription\.key"\s*:\s*"([a-f0-9]{32})"',
+            r'"crm\.apim\.key"\s*:\s*"([a-f0-9]{32})"',
+        ]
+        for pattern in key_patterns:
+            match = re.search(pattern, js_content)
+            if match:
+                subscription_key = match.group(1)
+                break
+
+        if base_url and subscription_key:
+            _LOGGER.info("Successfully extracted config from scsiconfig.js")
+            return {
+                "base_url": base_url,
+                "subscription_key": subscription_key,
+            }
+
+        _LOGGER.debug(
+            "Config JS file found but missing values (base_url=%s, key=%s)",
+            bool(base_url),
+            bool(subscription_key),
+        )
+        return None
+
+    except aiohttp.ClientError as err:
+        _LOGGER.debug("Error fetching config JS: %s", err)
+        return None
 
 
 def _extract_api_url_from_html(html: str) -> str | None:
