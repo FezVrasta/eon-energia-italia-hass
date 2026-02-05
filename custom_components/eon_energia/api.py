@@ -44,6 +44,8 @@ class EONEnergiaApi:
         access_token: str,
         refresh_token: str | None = None,
         token_callback: Callable[[str, str], None] | None = None,
+        username: str | None = None,
+        password: str | None = None,
     ) -> None:
         """Initialize the API client.
 
@@ -52,10 +54,14 @@ class EONEnergiaApi:
             refresh_token: The refresh token for automatic renewal.
             token_callback: Callback to notify when tokens are refreshed.
                            Called with (new_access_token, new_refresh_token).
+            username: Optional username for re-authentication if refresh fails.
+            password: Optional password for re-authentication if refresh fails.
         """
         self._access_token = access_token
         self._refresh_token = refresh_token
         self._token_callback = token_callback
+        self._username = username
+        self._password = password
         self._session: aiohttp.ClientSession | None = None
         self._api_config: dict[str, str] | None = None
 
@@ -163,6 +169,58 @@ class EONEnergiaApi:
             _LOGGER.error("Token refresh connection error: %s", err)
             return False
 
+    async def reauthenticate(self) -> bool:
+        """Re-authenticate using stored username and password.
+
+        This is used when the refresh token has expired and we need to
+        perform a full login again.
+
+        Returns:
+            True if re-authentication was successful, False otherwise.
+        """
+        if not self._username or not self._password:
+            _LOGGER.warning("No credentials available for re-authentication")
+            return False
+
+        _LOGGER.info("Attempting re-authentication with stored credentials")
+
+        try:
+            from .auth import EONAuth0Client, EONAuthError, EONMFARequiredError
+
+            tokens = await EONAuth0Client.login(self._username, self._password)
+
+            new_access_token = tokens.get("access_token")
+            new_refresh_token = tokens.get("refresh_token")
+
+            if not new_access_token:
+                _LOGGER.error("No access token in re-authentication response")
+                return False
+
+            self._access_token = new_access_token
+            if new_refresh_token:
+                self._refresh_token = new_refresh_token
+
+            _LOGGER.info("Successfully re-authenticated")
+
+            # Notify callback about new tokens to persist them
+            if self._token_callback:
+                self._token_callback(
+                    new_access_token,
+                    new_refresh_token or self._refresh_token,
+                )
+
+            return True
+
+        except EONMFARequiredError:
+            _LOGGER.error("MFA required for re-authentication - cannot proceed automatically")
+            return False
+        except EONAuthError as err:
+            _LOGGER.error("Re-authentication failed: %s", err)
+            return False
+        except Exception as err:
+            _LOGGER.error("Unexpected error during re-authentication: %s", err)
+            return False
+
     async def _request(
         self,
         method: str,
@@ -187,12 +245,21 @@ class EONEnergiaApi:
             ) as response:
                 if response.status == 401:
                     # Token expired - try to refresh
-                    if retry_on_auth_error and self._refresh_token:
+                    if retry_on_auth_error:
                         _LOGGER.info("Access token expired, attempting refresh")
-                        if await self.refresh_access_token():
+                        refreshed = False
+                        if self._refresh_token:
+                            refreshed = await self.refresh_access_token()
+
+                        # If refresh failed or no refresh token, try re-authentication
+                        if not refreshed and self._username and self._password:
+                            _LOGGER.info("Refresh failed, attempting re-authentication")
+                            refreshed = await self.reauthenticate()
+
+                        if refreshed:
                             # Retry the request with the new token
                             return await self._request(
-                                method, endpoint, data, retry_on_auth_error=False
+                                method, endpoint, data, params, retry_on_auth_error=False
                             )
                     raise EONEnergiaAuthError("Invalid or expired access token")
 

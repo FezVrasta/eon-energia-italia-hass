@@ -51,6 +51,8 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
         self._reconfig_entry: ConfigEntry | None = None
         self._mfa_session_data: dict[str, Any] | None = None
         self._tariff_type: str | None = None
+        self._username: str | None = None
+        self._password: str | None = None
 
     @staticmethod
     @callback
@@ -76,6 +78,8 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
 
                     self._access_token = tokens["access_token"]
                     self._refresh_token = tokens.get("refresh_token")
+                    self._username = username
+                    self._password = password
 
                     # Now fetch PODs
                     api = EONEnergiaApi(
@@ -98,6 +102,9 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                 except EONMFARequiredError as err:
                     _LOGGER.info("MFA required for authentication")
                     self._mfa_session_data = err.session_data
+                    # Store credentials for after MFA completion
+                    self._username = username
+                    self._password = password
                     return await self.async_step_mfa()
                 except EONAuthError as err:
                     _LOGGER.error("Authentication failed: %s", err)
@@ -293,6 +300,8 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_REFRESH_TOKEN: self._refresh_token,
                     CONF_POD: self._selected_pod,
                     CONF_TARIFF_TYPE: tariff_type,
+                    CONF_USERNAME: self._username,
+                    CONF_PASSWORD: self._password,
                 },
             )
 
@@ -396,6 +405,8 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                                         CONF_REFRESH_TOKEN: refresh_token,
                                         CONF_POD: current_pod,
                                         CONF_TARIFF_TYPE: tariff_type,
+                                        CONF_USERNAME: username,
+                                        CONF_PASSWORD: password,
                                     },
                                 )
                     finally:
@@ -405,6 +416,8 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                     _LOGGER.info("MFA required for reconfiguration")
                     self._mfa_session_data = err.session_data
                     self._tariff_type = tariff_type
+                    self._username = username
+                    self._password = password
                     return await self.async_step_reconfigure_mfa()
                 except EONAuthError as err:
                     _LOGGER.error("Authentication failed: %s", err)
@@ -487,6 +500,8 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                                         CONF_REFRESH_TOKEN: refresh_token,
                                         CONF_POD: current_pod,
                                         CONF_TARIFF_TYPE: self._tariff_type,
+                                        CONF_USERNAME: self._username,
+                                        CONF_PASSWORD: self._password,
                                     },
                                 )
                     finally:
@@ -552,6 +567,9 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                                 if current_pod not in pod_codes:
                                     errors["base"] = "pod_not_found"
                                 else:
+                                    # Preserve existing credentials if available
+                                    existing_username = self._reconfig_entry.data.get(CONF_USERNAME)
+                                    existing_password = self._reconfig_entry.data.get(CONF_PASSWORD)
                                     return self.async_update_reload_and_abort(
                                         self._reconfig_entry,
                                         data={
@@ -559,6 +577,8 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                                             CONF_REFRESH_TOKEN: refresh_token,
                                             CONF_POD: current_pod,
                                             CONF_TARIFF_TYPE: self._tariff_type,
+                                            CONF_USERNAME: existing_username,
+                                            CONF_PASSWORD: existing_password,
                                         },
                                     )
                         finally:
@@ -599,6 +619,8 @@ class EONEnergiaOptionsFlow(OptionsFlow):
         """Initialize the options flow."""
         self._mfa_session_data: dict[str, Any] | None = None
         self._tariff_type: str | None = None
+        self._username: str | None = None
+        self._password: str | None = None
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -655,6 +677,8 @@ class EONEnergiaOptionsFlow(OptionsFlow):
                                     CONF_ACCESS_TOKEN: access_token,
                                     CONF_REFRESH_TOKEN: refresh_token,
                                     CONF_TARIFF_TYPE: tariff_type,
+                                    CONF_USERNAME: username,
+                                    CONF_PASSWORD: password,
                                 }
                                 self.hass.config_entries.async_update_entry(
                                     self.config_entry,
@@ -668,6 +692,8 @@ class EONEnergiaOptionsFlow(OptionsFlow):
                     _LOGGER.info("MFA required for options re-authentication")
                     self._mfa_session_data = err.session_data
                     self._tariff_type = tariff_type
+                    self._username = username
+                    self._password = password
                     return await self.async_step_mfa()
                 except EONAuthError as err:
                     _LOGGER.error("Authentication failed: %s", err)
@@ -748,6 +774,8 @@ class EONEnergiaOptionsFlow(OptionsFlow):
                                     CONF_ACCESS_TOKEN: access_token,
                                     CONF_REFRESH_TOKEN: refresh_token,
                                     CONF_TARIFF_TYPE: self._tariff_type,
+                                    CONF_USERNAME: self._username,
+                                    CONF_PASSWORD: self._password,
                                 }
                                 self.hass.config_entries.async_update_entry(
                                     self.config_entry,

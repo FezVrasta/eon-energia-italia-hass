@@ -21,7 +21,7 @@ from homeassistant.components.recorder.statistics import (
 )
 from homeassistant.components.sensor import SensorDeviceClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CURRENCY_EURO, Platform, UnitOfEnergy
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, CURRENCY_EURO, Platform, UnitOfEnergy
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
@@ -130,6 +130,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     access_token = entry.data[CONF_ACCESS_TOKEN]
     refresh_token = entry.data.get(CONF_REFRESH_TOKEN)
     pod = entry.data[CONF_POD]
+    username = entry.data.get(CONF_USERNAME)
+    password = entry.data.get(CONF_PASSWORD)
 
     def token_refresh_callback(new_access_token: str, new_refresh_token: str) -> None:
         """Handle token refresh by updating the config entry."""
@@ -145,6 +147,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         access_token=access_token,
         refresh_token=refresh_token,
         token_callback=token_refresh_callback,
+        username=username,
+        password=password,
     )
 
     # Validate the token (will auto-refresh if needed and refresh token is available)

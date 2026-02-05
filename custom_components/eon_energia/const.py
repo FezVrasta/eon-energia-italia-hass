@@ -25,6 +25,7 @@ CONF_REFRESH_TOKEN = "refresh_token"
 CONF_POD = "pod"  # Point of Delivery (PR code)
 CONF_TOKEN_EXPIRES = "token_expires"
 CONF_TARIFF_TYPE = "tariff_type"
+# Note: CONF_USERNAME and CONF_PASSWORD use homeassistant.const values
 
 # Tariff types
 TARIFF_MONORARIA = "monoraria"
