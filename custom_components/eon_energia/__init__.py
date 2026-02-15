@@ -16,6 +16,7 @@ from homeassistant.components.recorder.models import (
 )
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
+    clear_statistics,
     get_last_statistics,
     statistics_during_period,
 )
@@ -330,6 +331,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     async def handle_import_statistics(call: ServiceCall) -> None:
         """Handle the import_statistics service call."""
         days = call.data.get("days", 90)
+        clear_existing = call.data.get("clear_existing", False)
 
         _LOGGER.info("Starting historical data import for the last %d days", days)
 
@@ -351,11 +353,26 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             tariff_type = entry_data.get("tariff_type", TARIFF_MULTIORARIA)
 
             _LOGGER.info(
-                "Importing statistics for POD %s (tariff: %s, days: %d)",
+                "Importing statistics for POD %s (tariff: %s, days: %d, clear_existing: %s)",
                 pod,
                 tariff_type,
                 days,
+                clear_existing,
             )
+
+            # Clear existing statistics if requested
+            if clear_existing:
+                statistic_ids = [
+                    f"{DOMAIN}:{pod}_consumption",
+                    f"{DOMAIN}:{pod}_consumption_f1",
+                    f"{DOMAIN}:{pod}_consumption_f2",
+                    f"{DOMAIN}:{pod}_consumption_f3",
+                    f"{DOMAIN}:{pod}_cost",
+                ]
+                _LOGGER.info("Clearing existing statistics: %s", statistic_ids)
+                await get_instance(hass).async_add_executor_job(
+                    clear_statistics, get_instance(hass), statistic_ids
+                )
 
             # Set flag to prevent concurrent imports from coordinator
             import_state = entry_data.get("import_state", {})
@@ -416,6 +433,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             vol.Optional("days", default=90): vol.All(
                 vol.Coerce(int), vol.Range(min=1, max=365)
             ),
+            vol.Optional("clear_existing", default=False): bool,
         }),
     )
 
@@ -870,23 +888,54 @@ async def _import_historical_statistics(
             "unit_class": None,
         }
 
-    # Initialize running sums and statistics lists
-    # For historical import, we always start from 0 since we're importing a fresh set of data
-    # The async_add_external_statistics will handle merging/replacing existing data
-    running_sums: dict[str, float] = {}
-    statistics: dict[str, list[StatisticData]] = {}
-
-    for key, config in stat_configs.items():
-        # Start from 0 for historical import - we're rebuilding the statistics
-        running_sums[key] = 0.0
-        statistics[key] = []
-        _LOGGER.debug("Initializing %s sum to 0 for historical import", config["id"])
-
     # Use timezone-aware dates to avoid DST issues
     # The API dates are in local Italian time, so we use that for consistency
     now = dt_util.now()  # Timezone-aware datetime
     end_date = now - timedelta(days=2)  # API has 2-day delay
     start_date = end_date - timedelta(days=days)
+
+    # Initialize running sums and statistics lists
+    # Query existing statistics to find the sum BEFORE our import range to avoid discontinuities
+    running_sums: dict[str, float] = {}
+    statistics: dict[str, list[StatisticData]] = {}
+
+    # Query for statistics BEFORE start_date to find the correct starting sum
+    # Use a reasonable lookback period (2 years before start_date)
+    query_start = start_date - timedelta(days=730)
+
+    for key, config in stat_configs.items():
+        statistic_id = config["id"]
+        # Query for statistics in the period BEFORE our import range
+        prior_stats = await get_instance(hass).async_add_executor_job(
+            statistics_during_period,
+            hass,
+            query_start,
+            start_date,  # end_time is start of our import range
+            [statistic_id],
+            "hour",
+            None,
+            {"sum"},
+        )
+
+        if prior_stats and statistic_id in prior_stats and prior_stats[statistic_id]:
+            # Get the last entry before our import range (list is sorted by time)
+            last_entry = prior_stats[statistic_id][-1]
+            running_sums[key] = last_entry["sum"]
+            _LOGGER.debug(
+                "Historical import: continuing from existing sum=%.3f for %s (from data before %s)",
+                last_entry["sum"],
+                statistic_id,
+                start_date.strftime("%Y-%m-%d"),
+            )
+        else:
+            running_sums[key] = 0.0
+            _LOGGER.debug(
+                "Historical import: no data before %s for %s, starting from 0",
+                start_date.strftime("%Y-%m-%d"),
+                statistic_id,
+            )
+
+        statistics[key] = []
 
     # Count invoiced vs estimated days for logging
     invoiced_days = 0

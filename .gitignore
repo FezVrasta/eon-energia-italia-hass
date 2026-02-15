@@ -62,3 +62,5 @@ htmlcov/
 # Local development
 config/
 secrets.yaml
+
+test_api.py

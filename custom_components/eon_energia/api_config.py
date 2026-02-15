@@ -202,8 +202,11 @@ async def _try_fetch_from_config_js(
         for pattern in url_patterns:
             match = re.search(pattern, js_content)
             if match:
-                # Handle escaped characters like \u002D for hyphen
-                url = match.group(1).encode().decode("unicode_escape")
+                url = match.group(1)
+                # Handle escaped forward slashes (common in JSON: \/)
+                url = url.replace("\\/", "/")
+                # Handle Unicode escapes like \u002D for hyphen
+                url = url.encode().decode("unicode_escape")
                 # api.url might have /scsi suffix, we want the base
                 if url.endswith("/scsi"):
                     url = url[:-5]

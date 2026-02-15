@@ -14,3 +14,10 @@ import_statistics:
           max: 365
           mode: box
           unit_of_measurement: days
+    clear_existing:
+      name: Clear Existing Statistics
+      description: Clear all existing statistics before importing. Use this for a clean slate import without discontinuities.
+      required: false
+      default: false
+      selector:
+        boolean:
