@@ -17,7 +17,6 @@ from homeassistant.components.recorder.models import (
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     clear_statistics,
-    get_last_statistics,
     statistics_during_period,
 )
 from homeassistant.components.sensor import SensorDeviceClass
@@ -440,6 +439,96 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     return True
 
 
+def _stat_row_start(row: dict[str, Any]) -> datetime:
+    """Return a statistics row's start as an aware datetime.
+
+    The recorder hands back a float timestamp on current versions and a
+    datetime on older ones.
+    """
+    start = row["start"]
+    if isinstance(start, (int, float)):
+        return dt_util.utc_from_timestamp(start)
+    return start
+
+
+async def _build_rebased_statistics(
+    hass: HomeAssistant,
+    statistic_id: str,
+    new_values: dict[datetime, float],
+) -> list[StatisticData]:
+    """Build a statistics series whose cumulative ``sum`` stays monotonic.
+
+    Home Assistant stores a running total per hour and the Energy Dashboard
+    renders the difference between consecutive hours. That means an hour cannot
+    be written in isolation: if it lands before existing data, every later hour
+    has to be renumbered too.
+
+    Seeding the running total from the *latest* stored row (which is what this
+    integration used to do) and then writing earlier hours produced a spike
+    where the rewritten range started and a negative reading where it rejoined
+    untouched data. Both were visible on the Energy Dashboard.
+
+    So: seed from the row immediately before the earliest hour being written,
+    merge the new values over everything from that point on, and recompute the
+    whole tail. Running it twice over the same data is a no-op.
+    """
+    if not new_values:
+        return []
+
+    first_start = min(new_values)
+
+    # Seed from the last cumulative sum strictly before the rewritten range.
+    prior = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        first_start - timedelta(days=730),
+        first_start,
+        [statistic_id],
+        "hour",
+        None,
+        {"sum"},
+    )
+    running = 0.0
+    if prior and prior.get(statistic_id):
+        running = prior[statistic_id][-1].get("sum") or 0.0
+
+    # Everything from the first affected hour onwards has to be renumbered.
+    existing = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        first_start,
+        None,
+        [statistic_id],
+        "hour",
+        None,
+        {"state"},
+    )
+
+    merged: dict[datetime, float] = {}
+    if existing and existing.get(statistic_id):
+        for row in existing[statistic_id]:
+            if row.get("state") is not None:
+                merged[_stat_row_start(row)] = float(row["state"])
+
+    # Freshly fetched values win over whatever was stored before.
+    merged.update(new_values)
+
+    series: list[StatisticData] = []
+    for start in sorted(merged):
+        running += merged[start]
+        series.append(StatisticData(start=start, sum=running, state=merged[start]))
+
+    _LOGGER.debug(
+        "Rebased %s: %d new hour(s), %d hour(s) rewritten from %s, seed sum=%.3f",
+        statistic_id,
+        len(new_values),
+        len(series),
+        first_start,
+        running - sum(merged.values()),
+    )
+    return series
+
+
 async def _import_days_batch(
     hass: HomeAssistant,
     days_data: list[tuple[datetime, dict[str, Any]]],
@@ -501,28 +590,10 @@ async def _import_days_batch(
             "unit_class": None,
         }
 
-    # Get current running sums from existing statistics ONCE at the start
-    running_sums: dict[str, float] = {}
-    for key, config in stat_configs.items():
-        statistic_id = config["id"]
-        last_stats = await get_instance(hass).async_add_executor_job(
-            get_last_statistics, hass, 1, statistic_id, True, {"sum", "start"}
-        )
-        if last_stats and statistic_id in last_stats:
-            last_entry = last_stats[statistic_id][0]
-            running_sums[key] = last_entry["sum"]
-            _LOGGER.debug(
-                "Batch import: found existing %s sum=%.3f from start=%s",
-                statistic_id,
-                last_entry["sum"],
-                last_entry.get("start"),
-            )
-        else:
-            running_sums[key] = 0.0
-            _LOGGER.debug("Batch import: no existing data for %s, starting from 0", statistic_id)
-
-    # Process all days and build statistics
-    statistics: dict[str, list[StatisticData]] = {key: [] for key in stat_configs}
+    # Collect the hourly values per statistic. Cumulative sums are deliberately
+    # NOT computed here: _build_rebased_statistics() works them out against
+    # whatever is already stored, so an overlapping re-import stays monotonic.
+    new_values: dict[str, dict[datetime, float]] = {key: {} for key in stat_configs}
 
     for date, day_data in days_data:
         for hour in range(1, 25):
@@ -539,49 +610,25 @@ async def _import_days_batch(
                 local_day_start = dt_util.start_of_local_day(date)
                 stat_time = local_day_start + timedelta(hours=hour - 1)
 
-                # Update total consumption
-                running_sums["total"] += hourly_value
-                statistics["total"].append(
-                    StatisticData(
-                        start=stat_time,
-                        sum=running_sums["total"],
-                        state=hourly_value,
-                    )
-                )
+                new_values["total"][stat_time] = hourly_value
 
-                # Update fascia-specific statistics
                 fascia = None
                 if is_multioraria:
                     fascia = _get_fascia_for_hour(date, hour)
-                    running_sums[fascia] += hourly_value
-                    statistics[fascia].append(
-                        StatisticData(
-                            start=stat_time,
-                            sum=running_sums[fascia],
-                            state=hourly_value,
-                        )
-                    )
+                    new_values[fascia][stat_time] = hourly_value
 
-                # Update cost statistics
                 if has_pricing:
                     hourly_price, _ = _get_price_for_date(hass, pod, date.date(), fascia)
                     if hourly_price:
-                        hourly_cost = hourly_value * hourly_price
-                        running_sums["cost"] += hourly_cost
-                        statistics["cost"].append(
-                            StatisticData(
-                                start=stat_time,
-                                sum=running_sums["cost"],
-                                state=hourly_cost,
-                            )
-                        )
+                        new_values["cost"][stat_time] = hourly_value * hourly_price
 
             except (ValueError, TypeError):
                 continue
 
     # Import all statistics at once
     for key, config in stat_configs.items():
-        if statistics[key]:
+        series = await _build_rebased_statistics(hass, config["id"], new_values[key])
+        if series:
             metadata = StatisticMetaData(
                 has_mean=False,
                 has_sum=True,
@@ -592,12 +639,13 @@ async def _import_days_batch(
                 unit_of_measurement=config["unit"],
                 unit_class=config["unit_class"],
             )
-            async_add_external_statistics(hass, metadata, statistics[key])
+            async_add_external_statistics(hass, metadata, series)
 
     _LOGGER.info(
-        "Batch imported %d days of statistics (total: %.3f kWh)",
+        "Batch imported %d days of statistics (%.3f kWh across %d hours)",
         len(days_data),
-        running_sums["total"],
+        sum(new_values["total"].values()),
+        len(new_values["total"]),
     )
 
 
@@ -661,28 +709,10 @@ async def _import_day_statistics(
             "unit_class": None,
         }
 
-    # Get current running sums from existing statistics
-    running_sums: dict[str, float] = {}
-    for key, config in stat_configs.items():
-        statistic_id = config["id"]
-        last_stats = await get_instance(hass).async_add_executor_job(
-            get_last_statistics, hass, 1, statistic_id, True, {"sum", "start"}
-        )
-        if last_stats and statistic_id in last_stats:
-            last_entry = last_stats[statistic_id][0]
-            running_sums[key] = last_entry["sum"]
-            _LOGGER.debug(
-                "Day import: found existing %s sum=%.3f from start=%s",
-                statistic_id,
-                last_entry["sum"],
-                last_entry.get("start"),
-            )
-        else:
-            running_sums[key] = 0.0
-            _LOGGER.debug("Day import: no existing data for %s, starting from 0", statistic_id)
-
-    # Process each hourly value and create statistics
-    statistics: dict[str, list[StatisticData]] = {key: [] for key in stat_configs}
+    # Hourly values only; _build_rebased_statistics() computes the cumulative
+    # sums against what is already stored. Re-importing a day that has already
+    # been imported is then a no-op rather than a discontinuity.
+    new_values: dict[str, dict[datetime, float]] = {key: {} for key in stat_configs}
 
     for hour in range(1, 25):
         field_key = f"valore_h{hour:02d}"
@@ -699,28 +729,13 @@ async def _import_day_statistics(
             local_day_start = dt_util.start_of_local_day(date)
             stat_time = local_day_start + timedelta(hours=hour - 1)
 
-            # Update total consumption
-            running_sums["total"] += hourly_value
-            statistics["total"].append(
-                StatisticData(
-                    start=stat_time,
-                    sum=running_sums["total"],
-                    state=hourly_value,
-                )
-            )
+            new_values["total"][stat_time] = hourly_value
 
             # Update fascia-specific statistics
             fascia = None
             if is_multioraria:
                 fascia = _get_fascia_for_hour(date, hour)
-                running_sums[fascia] += hourly_value
-                statistics[fascia].append(
-                    StatisticData(
-                        start=stat_time,
-                        sum=running_sums[fascia],
-                        state=hourly_value,
-                    )
-                )
+                new_values[fascia][stat_time] = hourly_value
 
             # Update cost statistics - use date-specific pricing from invoices
             if has_pricing:
@@ -729,15 +744,7 @@ async def _import_day_statistics(
                 )
 
                 if hourly_price:
-                    hourly_cost = hourly_value * hourly_price
-                    running_sums["cost"] += hourly_cost
-                    statistics["cost"].append(
-                        StatisticData(
-                            start=stat_time,
-                            sum=running_sums["cost"],
-                            state=hourly_cost,
-                        )
-                    )
+                    new_values["cost"][stat_time] = hourly_value * hourly_price
 
         except (ValueError, TypeError):
             continue
@@ -748,7 +755,8 @@ async def _import_day_statistics(
 
     # Import statistics for each type
     for key, config in stat_configs.items():
-        if statistics[key]:
+        series = await _build_rebased_statistics(hass, config["id"], new_values[key])
+        if series:
             metadata = StatisticMetaData(
                 has_mean=False,
                 has_sum=True,
@@ -759,24 +767,25 @@ async def _import_day_statistics(
                 unit_of_measurement=config["unit"],
                 unit_class=config["unit_class"],
             )
-            async_add_external_statistics(hass, metadata, statistics[key])
+            async_add_external_statistics(hass, metadata, series)
 
     data_date = day_data.get("data", date.strftime("%Y-%m-%d"))
+    day_total = sum(new_values["total"].values())
     if has_pricing:
         _LOGGER.info(
             "Auto-imported %d hourly statistics for %s (total: %.3f kWh, cost: €%.2f - %s)",
-            len(statistics["total"]),
+            len(new_values["total"]),
             data_date,
-            running_sums["total"],
-            running_sums.get("cost", 0),
+            day_total,
+            sum(new_values.get("cost", {}).values()),
             pricing_source,
         )
     else:
         _LOGGER.info(
             "Auto-imported %d hourly statistics for %s (total: %.3f kWh)",
-            len(statistics["total"]),
+            len(new_values["total"]),
             data_date,
-            running_sums["total"],
+            day_total,
         )
 
 
@@ -894,48 +903,12 @@ async def _import_historical_statistics(
     end_date = now - timedelta(days=2)  # API has 2-day delay
     start_date = end_date - timedelta(days=days)
 
-    # Initialize running sums and statistics lists
-    # Query existing statistics to find the sum BEFORE our import range to avoid discontinuities
-    running_sums: dict[str, float] = {}
-    statistics: dict[str, list[StatisticData]] = {}
-
-    # Query for statistics BEFORE start_date to find the correct starting sum
-    # Use a reasonable lookback period (2 years before start_date)
-    query_start = start_date - timedelta(days=730)
-
-    for key, config in stat_configs.items():
-        statistic_id = config["id"]
-        # Query for statistics in the period BEFORE our import range
-        prior_stats = await get_instance(hass).async_add_executor_job(
-            statistics_during_period,
-            hass,
-            query_start,
-            start_date,  # end_time is start of our import range
-            [statistic_id],
-            "hour",
-            None,
-            {"sum"},
-        )
-
-        if prior_stats and statistic_id in prior_stats and prior_stats[statistic_id]:
-            # Get the last entry before our import range (list is sorted by time)
-            last_entry = prior_stats[statistic_id][-1]
-            running_sums[key] = last_entry["sum"]
-            _LOGGER.debug(
-                "Historical import: continuing from existing sum=%.3f for %s (from data before %s)",
-                last_entry["sum"],
-                statistic_id,
-                start_date.strftime("%Y-%m-%d"),
-            )
-        else:
-            running_sums[key] = 0.0
-            _LOGGER.debug(
-                "Historical import: no data before %s for %s, starting from 0",
-                start_date.strftime("%Y-%m-%d"),
-                statistic_id,
-            )
-
-        statistics[key] = []
+    # Hourly values only. This function used to seed a running sum from the data
+    # before start_date, which got the head of the range right but left every
+    # hour *after* the range holding its old total - a negative reading on the
+    # Energy Dashboard where the two met. _build_rebased_statistics() renumbers
+    # the tail as well.
+    new_values: dict[str, dict[datetime, float]] = {key: {} for key in stat_configs}
 
     # Count invoiced vs estimated days for logging
     invoiced_days = 0
@@ -1001,42 +974,18 @@ async def _import_historical_statistics(
                 local_day_start = dt_util.start_of_local_day(current_date)
                 stat_time = local_day_start + timedelta(hours=hour - 1)
 
-                # Update total
-                running_sums["total"] += hourly_value
-                statistics["total"].append(
-                    StatisticData(
-                        start=stat_time,
-                        sum=running_sums["total"],
-                        state=hourly_value,
-                    )
-                )
+                new_values["total"][stat_time] = hourly_value
 
-                # Update fascia-specific statistic (only for multioraria)
+                # Fascia-specific statistic (only for multioraria)
                 fascia = None
                 if is_multioraria:
                     fascia = _get_fascia_for_hour(current_date, hour)
-                    running_sums[fascia] += hourly_value
-                    statistics[fascia].append(
-                        StatisticData(
-                            start=stat_time,
-                            sum=running_sums[fascia],
-                            state=hourly_value,
-                        )
-                    )
+                    new_values[fascia][stat_time] = hourly_value
 
-                # Update cost statistics
                 if has_pricing:
                     hourly_price, _ = _get_price_for_date(hass, pod, current_date.date(), fascia)
                     if hourly_price:
-                        hourly_cost = hourly_value * hourly_price
-                        running_sums["cost"] += hourly_cost
-                        statistics["cost"].append(
-                            StatisticData(
-                                start=stat_time,
-                                sum=running_sums["cost"],
-                                state=hourly_cost,
-                            )
-                        )
+                        new_values["cost"][stat_time] = hourly_value * hourly_price
 
             except (ValueError, TypeError):
                 pass
@@ -1054,7 +1003,8 @@ async def _import_historical_statistics(
 
     # Import statistics for each type
     for key, config in stat_configs.items():
-        if statistics[key]:
+        series = await _build_rebased_statistics(hass, config["id"], new_values[key])
+        if series:
             metadata = StatisticMetaData(
                 has_mean=False,
                 has_sum=True,
@@ -1065,16 +1015,21 @@ async def _import_historical_statistics(
                 unit_of_measurement=config["unit"],
                 unit_class=config["unit_class"],
             )
-            _LOGGER.info("Importing %d hourly statistics for %s", len(statistics[key]), config["name"])
-            async_add_external_statistics(hass, metadata, statistics[key])
+            _LOGGER.info(
+                "Importing %d new hourly statistics for %s (%d rewritten)",
+                len(new_values[key]),
+                config["name"],
+                len(series),
+            )
+            async_add_external_statistics(hass, metadata, series)
 
     if has_pricing:
         _LOGGER.info(
             "Historical data import completed for %s (total: %.3f kWh, cost: €%.2f) - "
             "%d days from invoices, %d days estimated",
             pod,
-            running_sums["total"],
-            running_sums.get("cost", 0),
+            sum(new_values["total"].values()),
+            sum(new_values.get("cost", {}).values()),
             invoiced_days,
             estimated_days,
         )
@@ -1082,7 +1037,7 @@ async def _import_historical_statistics(
         _LOGGER.info(
             "Historical data import completed for %s (total: %.3f kWh, %d days)",
             pod,
-            running_sums["total"],
+            sum(new_values["total"].values()),
             len(daily_consumption),
         )
 
