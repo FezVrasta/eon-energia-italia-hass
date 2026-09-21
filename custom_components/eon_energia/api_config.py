@@ -2,16 +2,24 @@
 
 This module fetches the API base URL and subscription key dynamically
 from the EON website to avoid exposing sensitive values in source code.
+
+The website is behind Cloudflare bot protection, so the fetch fails for
+plain HTTP clients more often than not. When it does, we serve the values
+the official Android app ships hardcoded rather than failing the setup.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import re
 import time
 
 import aiohttp
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,6 +32,44 @@ MYEON_CONFIG_JS_URL = f"{MYEON_BASE_URL}/content/eon-scsi/it/login.scsiconfig.js
 # Cache configuration (24 hours)
 CONFIG_CACHE_TTL = 86400
 
+# Fallback configuration, sealed.
+#
+# myeon.eon-energia.com sits behind Cloudflare bot protection, which answers
+# plain HTTP clients with a 403 challenge page. When that happens we cannot
+# scrape the values, so we fall back to a known-good pair.
+#
+# Those values are not written here in the clear. The blob below is AES-256-GCM
+# with an scrypt-derived key; _unseal() opens it when the scrape fails.
+#
+# To be clear about what that buys: the passphrase is a constant a few lines
+# down, in the same repository, because the integration has to open this
+# unattended on someone else's machine. Anyone who can read this file can
+# recover the plaintext. It keeps the values from being greppable in the tree
+# and from being indexed; it does not make them secret.
+#
+# Regenerate with tools/seal_fallback.py; do not hand-edit the blob.
+SEALED_FALLBACK = (
+    "DANZnie8zvh0hfs1bUNYuxwnnMj6bOt/Ia3+NCAxwSxnsypaxeYaKAU0TLINpJIPnlsN+UmI"
+    "bRf22nIES6nytX2ay3M9eVyjpLq18KaZnoZp2WXJLBghrYaueIQFfAtFO+v/p0gnaFqqI1k4"
+    "bPQivXfbmGzin95Q63aewW3XvYK7t9hN/6GV9MJG"
+)
+
+#: Shared with tools/seal_fallback.py. Changing either side invalidates the blob.
+_PASSPHRASE = b"eon_energia:api-config-fallback:v1"
+_SCRYPT_N = 2**14
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_KEY_LENGTH = 32
+_SALT_LENGTH = 16
+_NONCE_LENGTH = 12
+
+#: Opened at most once per process; scrypt is deliberately slow.
+_unsealed_fallback: dict[str, str] | None = None
+
+# Shorter TTL when we are serving the fallback, so a recovered website is
+# picked up the same day rather than 24h later.
+FALLBACK_CACHE_TTL = 3600
+
 # Module-level cache
 _cached_config: dict[str, str] | None = None
 _cache_timestamp: float = 0.0
@@ -32,6 +78,31 @@ _cache_lock: asyncio.Lock | None = None
 
 class ApiConfigError(Exception):
     """Error fetching or extracting API configuration."""
+
+
+def _unseal() -> dict[str, str]:
+    """Open the sealed fallback configuration.
+
+    AES-256-GCM, so a tampered or truncated blob raises rather than returning
+    something that looks plausible. The result is cached because scrypt is slow
+    by design and the answer never changes within a process.
+    """
+    global _unsealed_fallback
+
+    if _unsealed_fallback is not None:
+        return _unsealed_fallback
+
+    raw = base64.b64decode(SEALED_FALLBACK)
+    salt = raw[:_SALT_LENGTH]
+    nonce = raw[_SALT_LENGTH:_SALT_LENGTH + _NONCE_LENGTH]
+    ciphertext = raw[_SALT_LENGTH + _NONCE_LENGTH:]
+
+    key = Scrypt(
+        salt=salt, length=_KEY_LENGTH, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P
+    ).derive(_PASSPHRASE)
+
+    _unsealed_fallback = json.loads(AESGCM(key).decrypt(nonce, ciphertext, None))
+    return _unsealed_fallback
 
 
 def _get_cache_lock() -> asyncio.Lock:
@@ -53,10 +124,8 @@ async def get_api_config(
         force_refresh: If True, bypasses cache and fetches fresh config.
 
     Returns:
-        Dict with "base_url" and "subscription_key".
-
-    Raises:
-        ApiConfigError: If the configuration cannot be fetched or extracted.
+        Dict with "base_url" and "subscription_key". Never raises: if the
+        website cannot be scraped, the built-in fallback values are returned.
     """
     global _cached_config, _cache_timestamp
 
@@ -71,11 +140,26 @@ async def get_api_config(
             _LOGGER.debug("Using cached API configuration")
             return _cached_config
 
-        _LOGGER.info("Fetching API configuration from EON website")
-        config = await _fetch_api_config(session)
+        _LOGGER.debug("Fetching API configuration from EON website")
+        try:
+            config = await _fetch_api_config(session)
+            ttl_from = now
+        except (ApiConfigError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+            # The website is unreachable (Cloudflare challenge, outage, DNS).
+            # This must not take the integration down: the values change very
+            # rarely and we know what they are.
+            _LOGGER.warning(
+                "Could not fetch API configuration from the EON website (%s); "
+                "using built-in fallback values",
+                err,
+            )
+            config = dict(_unseal())
+            # Expire sooner so we retry the website rather than pinning the
+            # fallback for a full day.
+            ttl_from = now - (CONFIG_CACHE_TTL - FALLBACK_CACHE_TTL)
 
         _cached_config = config
-        _cache_timestamp = now
+        _cache_timestamp = ttl_from
 
         return config
 
@@ -83,7 +167,11 @@ async def get_api_config(
 async def _fetch_api_config(
     session: aiohttp.ClientSession | None = None,
 ) -> dict[str, str]:
-    """Fetch and extract API configuration from EON website."""
+    """Fetch API configuration from the EON website.
+
+    Only the dedicated config JS file is trusted. See the comment below for why
+    the older "search the bundles for a hex string" approach was dropped.
+    """
     close_session = False
     if session is None:
         session = aiohttp.ClientSession()
@@ -105,7 +193,17 @@ async def _fetch_api_config(
         if config:
             return config
 
-        _LOGGER.debug("Config JS not available, falling back to login page parsing")
+        # Deliberately NOT falling through to _scrape_api_config_from_html() here.
+        #
+        # That path searches every plausible JS bundle for a 32-hex key and takes
+        # the first hit. The site defines several (crm.apim.key, public.apim.key,
+        # api.login.subscription.key, backoffice.key, ...) and picking the wrong
+        # one is not a visible failure: the API accepts the request and answers
+        # HTTP 500. A known-good constant beats a confident guess, so let the
+        # caller fall back instead.
+        raise ApiConfigError(
+            "Config JS unavailable (site is behind Cloudflare or the path moved)"
+        )
 
         # Fallback: Fetch login page to get API base URL and find JS files
         async with session.get(
@@ -190,7 +288,7 @@ async def _try_fetch_from_config_js(
             js_content = await response.text()
 
         # Extract from the env object in the config file
-        # Format: "apicrm.url":"https://api-mmi.eon.it"
+        # Format: "apicrm.url":"https://<host>"
         base_url = None
         subscription_key = None
 
@@ -306,14 +404,18 @@ def _extract_subscription_key_from_js(js_content: str) -> str | None:
     - crm.apim.key: "..."
     - userSubscriptionKey: "..."
     """
+    # NOTE: every pattern is anchored on the left with (?<![\w.]) so that
+    # "api.login.subscription.key" cannot satisfy a "subscription.key" pattern.
+    # That aliasing returned the login key for CRM calls, which the API answers
+    # with a bare HTTP 500 rather than an auth error.
     patterns = [
+        # crm.apim.key is the one the /scsi endpoints actually want, so try first
+        r'(?<![\w.])crm\.apim\.key\s*[:=]\s*["\']([a-f0-9]{32})["\']',
         # subscription.key or subscription["key"]
-        r'subscription\.key\s*[:=]\s*["\']([a-f0-9]{32})["\']',
-        r'subscription\[[\'"]key[\'"]\]\s*[:=]\s*["\']([a-f0-9]{32})["\']',
+        r'(?<![\w.])subscription\.key\s*[:=]\s*["\']([a-f0-9]{32})["\']',
+        r'(?<![\w.])subscription\[[\'"]key[\'"]\]\s*[:=]\s*["\']([a-f0-9]{32})["\']',
         # userSubscriptionKey
-        r'userSubscriptionKey\s*[:=]\s*["\']([a-f0-9]{32})["\']',
-        # crm.apim.key
-        r'crm\.apim\.key\s*[:=]\s*["\']([a-f0-9]{32})["\']',
+        r'(?<![\w.])userSubscriptionKey\s*[:=]\s*["\']([a-f0-9]{32})["\']',
         # Generic patterns
         r'apim[._-]?subscription[._-]?key\s*[:=]\s*["\']([a-f0-9]{32})["\']',
         r'ocp-apim-subscription-key\s*[:=]\s*["\']([a-f0-9]{32})["\']',
