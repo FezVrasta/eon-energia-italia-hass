@@ -62,13 +62,58 @@ async def build_authorization_url() -> str:
 
 
 def extract_code_from_callback(callback_url: str) -> str | None:
-    """Extract authorization code from callback URL."""
-    try:
-        parsed = urllib.parse.urlparse(callback_url)
-        query_params = urllib.parse.parse_qs(parsed.query)
-        return query_params.get("code", [None])[0]
-    except Exception:
+    """Extract the authorization code from whatever the user managed to copy.
+
+    The callback URI uses a custom scheme, so the browser refuses to open it and
+    there is no address bar to copy from. In practice people end up with one of:
+
+    - the bare URL, if they dug it out of the network log
+    - the whole console line, e.g.
+      ``Failed to launch 'com.eon-energia.eon.auth0://...?code=abc' because ...``
+    - just the code itself
+
+    All three are accepted rather than making the user produce one exact shape.
+    """
+    if not callback_url:
         return None
+
+    text = callback_url.strip().strip("'\"")
+
+    # Anything containing code=... wins, whether it's a bare URL or a sentence
+    # with a URL buried in it.
+    match = re.search(r"[?&#]code=([^&\s'\"]+)", text)
+    if match:
+        return urllib.parse.unquote(match.group(1))
+
+    try:
+        parsed = urllib.parse.urlparse(text)
+        code = urllib.parse.parse_qs(parsed.query).get("code", [None])[0]
+        if code:
+            return code
+    except ValueError:
+        pass
+
+    # A bare code pasted on its own. Auth0 codes are URL-safe base64-ish, so
+    # anything with whitespace or a scheme is not one.
+    if re.fullmatch(r"[A-Za-z0-9_\-.~]{20,}", text):
+        return text
+
+    return None
+
+
+CAPTCHA_MESSAGE = (
+    "EON's login is showing a bot-detection challenge (CAPTCHA), which this "
+    "integration cannot solve. Use the manual authentication step instead."
+)
+
+
+def _has_captcha(html: str) -> bool:
+    """Return True if an Auth0 page is presenting a bot-detection challenge."""
+    if not html:
+        return False
+    if "captcha" in _extract_hidden_fields(html):
+        return True
+    return bool(re.search(r"turnstile|recaptcha|hcaptcha", html, re.I))
 
 
 class EONAuthError(Exception):
@@ -178,6 +223,34 @@ class EONAuth0Client:
             # Check if we're on the password page
             if "/u/login/password" not in password_page_url:
                 _LOGGER.error("Not redirected to password page, URL: %s", password_page_url)
+
+                # Work out *why* so the log says something actionable. Without
+                # this the failure is indistinguishable from a wrong username.
+                page_fields = _extract_hidden_fields(password_page_html)
+                has_captcha = "captcha" in page_fields
+                page_errors = [
+                    re.sub(r"<[^>]+>", "", m.group(1)).strip()
+                    for m in re.finditer(
+                        r'<(?:div|span|p)[^>]*(?:error|alert)[^>]*>(.*?)</(?:div|span|p)>',
+                        password_page_html,
+                        re.S | re.I,
+                    )
+                ]
+                page_errors = [e for e in page_errors if e][:3]
+                _LOGGER.error(
+                    "Identifier step rejected (captcha_present=%s, hidden_fields=%s, "
+                    "page_messages=%s)",
+                    has_captcha,
+                    list(page_fields),
+                    page_errors,
+                )
+
+                if has_captcha:
+                    # Auth0 Attack Protection has decided this client looks like
+                    # a bot. A headless login cannot solve the challenge; the
+                    # config flow's manual OAuth step is the way through.
+                    raise EONAuthError(CAPTCHA_MESSAGE)
+
                 # Check for error messages in the page
                 if "user not found" in password_page_html.lower() or "no account" in password_page_html.lower():
                     raise EONAuthError("User not found")
@@ -186,6 +259,15 @@ class EONAuth0Client:
             # Step 2b: POST password to /u/login/password
             password_hidden_fields = _extract_hidden_fields(password_page_html)
             _LOGGER.debug("Password page hidden fields: %s", list(password_hidden_fields.keys()))
+
+            if "captcha" in password_hidden_fields:
+                # Submitting now would send the password into a form that cannot
+                # validate, and the resulting failure looks like a wrong password.
+                _LOGGER.error(
+                    "Password page carries a CAPTCHA challenge; not submitting "
+                    "credentials into a form that cannot succeed"
+                )
+                raise EONAuthError(CAPTCHA_MESSAGE)
 
             password_url = f"{AUTH_DOMAIN}/u/login/password?state={auth_state}"
             password_data = {
@@ -205,12 +287,19 @@ class EONAuth0Client:
                 allow_redirects=False,
             ) as resp:
                 redirect_url = resp.headers.get("Location")
+                password_submit_html = await resp.text()
                 _LOGGER.debug("Password submit response status: %s", resp.status)
                 _LOGGER.debug("Password submit redirect location: %s", redirect_url)
 
             # Check if redirect points back to login page (auth failed)
             if not redirect_url:
                 _LOGGER.error("No redirect after password submit")
+                if _has_captcha(password_submit_html):
+                    _LOGGER.error(
+                        "Password page returned a CAPTCHA challenge instead of a "
+                        "redirect; the credentials were most likely never checked"
+                    )
+                    raise EONAuthError(CAPTCHA_MESSAGE)
                 raise EONAuthError("Invalid username or password")
 
             if "/u/login" in redirect_url:
@@ -284,6 +373,35 @@ class EONAuth0Client:
                                 next_redirect = mfa_resp.headers.get("Location")
                                 _LOGGER.debug("MFA detect response status: %s", mfa_resp.status)
                                 _LOGGER.debug("MFA detect redirect: %s", next_redirect)
+
+                        # Check if it's the "Autorizza app" consent screen.
+                        # Auth0 shows this the first time an account authorises
+                        # this client, and on every login afterwards if consent
+                        # was not remembered. It is a plain form with an accept
+                        # and a deny action.
+                        elif "/u/consent" in full_url:
+                            _LOGGER.debug("Consent page, accepting")
+                            consent_hidden_fields = _extract_hidden_fields(page_html)
+                            form_action = _extract_form_action(page_html, full_url)
+
+                            consent_data = {
+                                **consent_hidden_fields,
+                                "state": auth_state,
+                                "action": "accept",
+                            }
+
+                            async with session.post(
+                                form_action,
+                                headers=headers,
+                                data=consent_data,
+                                allow_redirects=False,
+                            ) as consent_resp:
+                                next_redirect = consent_resp.headers.get("Location")
+                                _LOGGER.debug(
+                                    "Consent response status: %s, redirect: %s",
+                                    consent_resp.status,
+                                    next_redirect,
+                                )
 
                         # Check if it's MFA SMS/OTP code entry page
                         elif "mfa-sms" in full_url or "mfa-otp" in full_url or "enter code" in page_html.lower() or "verification code" in page_html.lower():

@@ -18,9 +18,38 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 
-# Import the auth module
-sys.path.insert(0, 'custom_components/eon_energia')
-from auth import EONAuth0Client, EONAuthError, EONMFARequiredError
+# Import the auth module.
+#
+# The integration's modules use relative imports (`from .api_config import ...`),
+# so they have to be loaded as a package. We can't just import
+# custom_components.eon_energia: its __init__.py pulls in homeassistant, which
+# isn't installed here. So bind the directory to a throwaway package name and
+# load only the modules we need.
+import importlib.util
+import pathlib
+import types
+
+_PKG = "eon_energia_standalone"
+_BASE = pathlib.Path(__file__).resolve().parent / "custom_components" / "eon_energia"
+
+_pkg = types.ModuleType(_PKG)
+_pkg.__path__ = [str(_BASE)]
+sys.modules[_PKG] = _pkg
+
+
+def _load(name: str):
+    """Load one integration module inside the throwaway package."""
+    spec = importlib.util.spec_from_file_location(f"{_PKG}.{name}", _BASE / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[f"{_PKG}.{name}"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_auth = _load("auth")
+EONAuth0Client = _auth.EONAuth0Client
+EONAuthError = _auth.EONAuthError
+EONMFARequiredError = _auth.EONMFARequiredError
 
 
 async def test_login(username: str, password: str) -> None:
