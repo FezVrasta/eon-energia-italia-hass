@@ -48,16 +48,16 @@
       },
       "auth_fallback": {
         "title": "Autenticazione Manuale",
-        "description": "Il login automatico non è riuscito. Puoi provare il metodo di autenticazione manuale:\n\n1. **Copia** questo URL e aprilo in una nuova scheda del browser:\n\n`{auth_url}`\n\n2. Accedi con le tue credenziali EON Energia\n3. Dopo il login, il browser proverà ad aprire un'app e mostrerà un errore - **questo è normale!**\n4. Apri gli **Strumenti per sviluppatori** del browser (premi F12 o Cmd+Option+I su Mac)\n5. Cerca nella scheda **Console** un errore come: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Clicca col tasto destro** sull'URL e seleziona \"Copia indirizzo link\" per copiare l'intero URL, poi incollalo qui sotto",
+        "description": "Il login automatico non è riuscito perché la pagina di accesso di EON mostra un controllo anti-bot che questa integrazione non può risolvere. Completarlo a mano richiede un minuto, e dovrebbe servire una volta sola.\n\n**Passo 1.** Apri questo URL in una scheda del browser:\n\n`{auth_url}`\n\n**Passo 2.** Accedi con il tuo account EON Energia e accetta la richiesta di autorizzazione.\n\n**Passo 3.** Il browser non riuscirà ad aprire un link `com.eon-energia.eon.auth0://`. Questo errore è il risultato corretto: il codice che serve è dentro quel link.\n\n**Passo 4.** Apri gli Strumenti per sviluppatori (F12, o Cmd+Option+I su Mac) e guarda la scheda Console. Vedrai una riga come:\n\n`Failed to launch 'com.eon-energia.eon.auth0://...?code=XXXXXX' because the scheme does not have a registered handler.`\n\n**Passo 5.** Seleziona tutta la riga, copiala e incollala qui sotto. Va bene il messaggio intero, solo l'URL, oppure solo il codice.\n\nIl codice è monouso e scade dopo un paio di minuti, quindi incollalo subito. Se fallisce, ricarica l'URL del passo 1 per ottenerne uno nuovo.",
         "data": {
-          "callback_url": "URL di Callback"
+          "callback_url": "URL di callback, messaggio della console, o codice"
         }
       },
       "reconfigure_fallback": {
         "title": "Autenticazione Manuale",
-        "description": "Il login automatico per il POD {pod} non è riuscito. Puoi provare il metodo di autenticazione manuale:\n\n1. **Copia** questo URL e aprilo in una nuova scheda del browser:\n\n`{auth_url}`\n\n2. Accedi con le tue credenziali EON Energia\n3. Dopo il login, il browser proverà ad aprire un'app e mostrerà un errore - **questo è normale!**\n4. Apri gli **Strumenti per sviluppatori** del browser (premi F12 o Cmd+Option+I su Mac)\n5. Cerca nella scheda **Console** un errore come: `Failed to launch 'com.eon-energia.eon.auth0://...'`\n6. **Clicca col tasto destro** sull'URL e seleziona \"Copia indirizzo link\" per copiare l'intero URL, poi incollalo qui sotto",
+        "description": "Il login automatico non è riuscito perché la pagina di accesso di EON mostra un controllo anti-bot che questa integrazione non può risolvere. Completarlo a mano richiede un minuto, e dovrebbe servire una volta sola.\n\n**Passo 1.** Apri questo URL in una scheda del browser:\n\n`{auth_url}`\n\n**Passo 2.** Accedi con il tuo account EON Energia e accetta la richiesta di autorizzazione.\n\n**Passo 3.** Il browser non riuscirà ad aprire un link `com.eon-energia.eon.auth0://`. Questo errore è il risultato corretto: il codice che serve è dentro quel link.\n\n**Passo 4.** Apri gli Strumenti per sviluppatori (F12, o Cmd+Option+I su Mac) e guarda la scheda Console. Vedrai una riga come:\n\n`Failed to launch 'com.eon-energia.eon.auth0://...?code=XXXXXX' because the scheme does not have a registered handler.`\n\n**Passo 5.** Seleziona tutta la riga, copiala e incollala qui sotto. Va bene il messaggio intero, solo l'URL, oppure solo il codice.\n\nIl codice è monouso e scade dopo un paio di minuti, quindi incollalo subito. Se fallisce, ricarica l'URL del passo 1 per ottenerne uno nuovo.",
         "data": {
-          "callback_url": "URL di Callback"
+          "callback_url": "URL di callback, messaggio della console, o codice"
         }
       }
     },
