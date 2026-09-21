@@ -1,10 +1,30 @@
-# EON Energia Italia - Home Assistant Integration
+<p align="center">
+  <img src="custom_components/eon_energia/brand/icon.png" width="128" alt="">
+</p>
 
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
-[![GitHub Release](https://img.shields.io/github/release/fezvrasta/eon-energia-italia-hass.svg)](https://github.com/fezvrasta/eon-energia-italia-hass/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+<h1 align="center">E.ON Energia for Home Assistant</h1>
 
-A custom Home Assistant integration for monitoring electricity consumption from EON Energia (Italy).
+<p align="center">
+  Your hourly electricity readings, in the Energy Dashboard.<br>
+  Costs come from your own invoices, not an assumed tariff.
+</p>
+
+<p align="center">
+  <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=FezVrasta&repository=eon-energia-italia-hass&category=integration">
+    <img src="https://my.home-assistant.io/badges/hacs_repository.svg" alt="Open this repository in HACS">
+  </a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/HACS-custom-41BDF5.svg" alt="HACS custom repository">
+  <img src="https://img.shields.io/github/release/fezvrasta/eon-energia-italia-hass.svg" alt="Release">
+  <img src="https://img.shields.io/badge/config-no%20YAML-41BDF5" alt="No YAML">
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
+</p>
+
+---
+
+E.ON's app shows you yesterday's electricity, hour by hour. Home Assistant's Energy Dashboard can show the same numbers next to everything else in the house, but nothing puts them there. This does, and it prices them from the invoices E.ON has actually issued you rather than a tariff you typed in once.
 
 ## Features
 
@@ -256,9 +276,17 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## Disclaimer
+## Legal notice
 
-This is an unofficial integration and is not affiliated with EON Energia. Use at your own risk.
+**Unofficial.** Not affiliated with, authorised by or endorsed by E.ON Energia S.p.A. "E.ON" and the E.ON logo are their trade marks, used here only to identify whose service this talks to, which is referential use under Article 14(1)(c) of Regulation (EU) 2017/1001. The files in `custom_components/eon_energia/brand/` are E.ON's artwork, reproduced so Home Assistant can label the integration.
+
+**What it does.** Signs in to E.ON's own API with credentials you supply, for an account you hold, and reads that account's consumption and billing data. It does not write, order, or change anything, and it makes fewer requests than the official app. No attempt is made to reach any account but your own, to circumvent authentication or rate limiting, or to defeat a technological protection measure.
+
+**Why this is allowed.** It is an independently created program interoperating with an existing one, which Articles 5(3) and 6 of Directive 2009/24/EC permit (in Italy, Articles 64-ter and 64-quater of Legge 633/1941); Article 8 makes contract terms purporting to remove the Article 5(3) right void. The data it retrieves is your own, which you are entitled to under Articles 15 and 20 GDPR, Articles 23 and 24 of Directive (EU) 2019/944 on the internal electricity market, and Chapter II of the Data Act (Regulation (EU) 2023/2854).
+
+**API configuration.** E.ON publish their API base URL and APIM subscription key in JavaScript on their public login page; the integration reads them from there at runtime and keeps an encrypted copy as a fallback. That encryption is obfuscation, not secrecy, and `api_config.py` says so. They are not anyone's credentials.
+
+None of the above is legal advice. No warranty; MIT licensed; use at your own risk, and you remain bound by your contract with E.ON. If E.ON consider anything here to infringe, open an issue and it will be addressed.
 
 ## Credits
 
