@@ -823,6 +823,78 @@ def _get_fascia_for_hour(dt: datetime, hour: int) -> str:
         return "F3"
 
 
+#: The API times out server-side on long hourly ranges. A month at a time is
+#: comfortably inside what it will answer.
+HISTORY_CHUNK_DAYS = 30
+
+#: Narrowest window worth retrying before giving up on it.
+MIN_CHUNK_DAYS = 4
+
+
+async def _fetch_consumption_chunked(
+    api: EONEnergiaApi,
+    pod: str,
+    start_date: datetime,
+    end_date: datetime,
+    chunk_days: int = HISTORY_CHUNK_DAYS,
+) -> list[dict[str, Any]] | None:
+    """Fetch daily consumption over a long range, a chunk at a time.
+
+    Returns the concatenated rows, or None if nothing could be fetched at all.
+    Chunks that fail even at the minimum width are skipped with a warning rather
+    than losing the rest of the range: a gap in one month should not cost the
+    other eleven.
+    """
+    collected: list[dict[str, Any]] = []
+    any_success = False
+    window_start = start_date
+
+    while window_start <= end_date:
+        window_end = min(window_start + timedelta(days=chunk_days - 1), end_date)
+        width = chunk_days
+
+        while True:
+            try:
+                rows = await api.get_daily_consumption(
+                    pod=pod, start_date=window_start, end_date=window_end
+                )
+                collected.extend(rows or [])
+                any_success = True
+                break
+            except EONEnergiaApiError as err:
+                if width <= MIN_CHUNK_DAYS:
+                    _LOGGER.warning(
+                        "Skipping %s..%s after repeated failures: %s",
+                        window_start.strftime("%Y-%m-%d"),
+                        window_end.strftime("%Y-%m-%d"),
+                        err,
+                    )
+                    break
+                width = max(width // 2, MIN_CHUNK_DAYS)
+                window_end = min(window_start + timedelta(days=width - 1), end_date)
+                _LOGGER.debug(
+                    "Chunk failed (%s); retrying %s..%s at %d days",
+                    err,
+                    window_start.strftime("%Y-%m-%d"),
+                    window_end.strftime("%Y-%m-%d"),
+                    width,
+                )
+
+        window_start = window_end + timedelta(days=1)
+
+    if not any_success:
+        _LOGGER.error("Failed to fetch any consumption data for the requested range")
+        return None
+
+    _LOGGER.info(
+        "Fetched %d days across %s..%s",
+        len(collected),
+        start_date.strftime("%Y-%m-%d"),
+        end_date.strftime("%Y-%m-%d"),
+    )
+    return collected
+
+
 async def _import_historical_statistics(
     hass: HomeAssistant,
     api: EONEnergiaApi,
@@ -924,15 +996,13 @@ async def _import_historical_statistics(
         tariff_type,
     )
 
-    # Fetch all data in one API call
-    try:
-        all_data = await api.get_daily_consumption(
-            pod=pod,
-            start_date=start_date,
-            end_date=end_date,
-        )
-    except EONEnergiaApiError as err:
-        _LOGGER.error("Failed to fetch consumption data: %s", err)
+    # Fetch in chunks. Asking for a long range in one call makes the API time out
+    # on its own side and answer HTTP 500 with "[1062] Read timed out" - a 200 day
+    # request fails reliably, while a month's worth comes back fine. A failed chunk
+    # is retried at half the width before being given up on, so one bad window
+    # costs that window rather than the whole import.
+    all_data = await _fetch_consumption_chunked(api, pod, start_date, end_date)
+    if all_data is None:
         return daily_consumption
 
     if not all_data:
