@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import voluptuous as vol
@@ -16,7 +16,6 @@ from homeassistant.components.recorder.models import (
 )
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
-    clear_statistics,
     statistics_during_period,
 )
 from homeassistant.components.sensor import SensorDeviceClass
@@ -369,9 +368,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     f"{DOMAIN}:{pod}_cost",
                 ]
                 _LOGGER.info("Clearing existing statistics: %s", statistic_ids)
-                await get_instance(hass).async_add_executor_job(
-                    clear_statistics, get_instance(hass), statistic_ids
-                )
+                # Must go through the recorder's own scheduling, not a generic
+                # executor job: statistics_meta_manager.delete() asserts it is
+                # running on the recorder thread and raises "Detected unsafe
+                # call not in recorder thread" otherwise, which took the whole
+                # service call down with a 500.
+                get_instance(hass).async_clear_statistics(statistic_ids)
 
             # Set flag to prevent concurrent imports from coordinator
             import_state = entry_data.get("import_state", {})
@@ -529,6 +531,51 @@ async def _build_rebased_statistics(
     return series
 
 
+#: A plausible band for a price derived from one invoice over one month of kWh,
+#: in EUR/kWh. Italian retail electricity sits far inside this; anything outside
+#: it means the invoice and the consumption cover different periods.
+MIN_DERIVED_PRICE = 0.05
+MAX_DERIVED_PRICE = 1.50
+
+
+def _local_hour_starts(day: datetime) -> list[datetime]:
+    """Return every hour start in a local calendar day.
+
+    Usually 24, but 23 on the spring-forward day and 25 on the autumn one.
+
+    The obvious `start_of_local_day(day) + timedelta(hours=n)` is wrong on those
+    two days: timedelta arithmetic on an aware datetime is absolute, so once the
+    offset changes every later hour is displaced by one. In October that put two
+    of E.ON's hourly readings on the same instant, and the second silently
+    overwrote the first while its value had already been added to the running
+    total - a real double count, visible in the data as an hour whose cumulative
+    delta was exactly twice its own value.
+    """
+    # Step in UTC, not local time. Adding a timedelta to an aware datetime is
+    # wall-clock arithmetic in Python: it bumps the naive fields and keeps the
+    # same tzinfo, so iterating locally yields 24 hours on every day of the year
+    # and never surfaces the repeated or missing one. Converting to UTC first
+    # makes the step absolute, which is the whole point.
+    start = dt_util.start_of_local_day(day).astimezone(timezone.utc)
+    end = dt_util.start_of_local_day(day + timedelta(days=1)).astimezone(timezone.utc)
+    count = round((end - start) / timedelta(hours=1))
+    return [start + timedelta(hours=i) for i in range(count)]
+
+
+def _stat_time_for_hour(day: datetime, hour: int) -> datetime | None:
+    """Map E.ON's 1-based hour field to an instant, or None if it has none.
+
+    E.ON always ship valore_h01..valore_h24, so on a 23-hour day the last field
+    has nowhere to go, and on a 25-hour day the final hour goes unreported. Both
+    are returned honestly - a dropped field or a gap - rather than folded onto a
+    neighbouring hour.
+    """
+    hours = _local_hour_starts(day)
+    if not 1 <= hour <= len(hours):
+        return None
+    return hours[hour - 1]
+
+
 async def _import_days_batch(
     hass: HomeAssistant,
     days_data: list[tuple[datetime, dict[str, Any]]],
@@ -606,9 +653,10 @@ async def _import_days_batch(
                 if hourly_value <= 0:
                     continue
 
-                # Create statistic timestamp
-                local_day_start = dt_util.start_of_local_day(date)
-                stat_time = local_day_start + timedelta(hours=hour - 1)
+                stat_time = _stat_time_for_hour(date, hour)
+                if stat_time is None:
+                    # No such local hour on this day (spring forward).
+                    continue
 
                 new_values["total"][stat_time] = hourly_value
 
@@ -724,10 +772,10 @@ async def _import_day_statistics(
             if hourly_value <= 0:
                 continue
 
-            # Create statistic timestamp (hour 1 = 00:00-01:00)
-            # Use dt_util.start_of_local_day for proper timezone handling
-            local_day_start = dt_util.start_of_local_day(date)
-            stat_time = local_day_start + timedelta(hours=hour - 1)
+            stat_time = _stat_time_for_hour(date, hour)
+            if stat_time is None:
+                # No such local hour on this day (spring forward).
+                continue
 
             new_values["total"][stat_time] = hourly_value
 
@@ -1040,9 +1088,10 @@ async def _import_historical_statistics(
 
                 day_total += hourly_value
 
-                # Create statistic timestamp
-                local_day_start = dt_util.start_of_local_day(current_date)
-                stat_time = local_day_start + timedelta(hours=hour - 1)
+                stat_time = _stat_time_for_hour(current_date, hour)
+                if stat_time is None:
+                    # No such local hour on this day (spring forward).
+                    continue
 
                 new_values["total"][stat_time] = hourly_value
 
@@ -1207,6 +1256,29 @@ async def _import_invoice_cost_statistics(
                         break
 
                     price_per_kwh = amount / month_kwh
+
+                    if not MIN_DERIVED_PRICE <= price_per_kwh <= MAX_DERIVED_PRICE:
+                        # The invoice and the consumption cover different spans.
+                        # It happens on the first month of data, where a full
+                        # invoice is divided by however many days we managed to
+                        # fetch: one account derived EUR7.16/kWh from EUR165 over
+                        # 23 kWh, which then priced that month's whole cost graph.
+                        # Better no price for the month than a wrong one.
+                        _LOGGER.warning(
+                            "Ignoring implausible price for %d-%02d: €%.2f over "
+                            "%.2f kWh is €%.4f/kWh, outside €%.2f-€%.2f. The "
+                            "invoice most likely covers a longer period than the "
+                            "consumption data available for it",
+                            target_year,
+                            target_month,
+                            amount,
+                            month_kwh,
+                            price_per_kwh,
+                            MIN_DERIVED_PRICE,
+                            MAX_DERIVED_PRICE,
+                        )
+                        break
+
                     monthly_prices[month_key] = price_per_kwh
 
                     _LOGGER.info(
