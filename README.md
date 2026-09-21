@@ -285,7 +285,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 **Why this is allowed.** It is an independently created program interoperating with an existing one, which Articles 5(3) and 6 of Directive 2009/24/EC permit (in Italy, Articles 64-ter and 64-quater of Legge 633/1941); Article 8 makes contract terms purporting to remove the Article 5(3) right void. The data it retrieves is your own, which you are entitled to under Articles 15 and 20 GDPR, Articles 23 and 24 of Directive (EU) 2019/944 on the internal electricity market, and Chapter II of the Data Act (Regulation (EU) 2023/2854).
 
 None of the above is legal advice. No warranty; MIT licensed; use at your own risk, and you remain bound by your contract with E.ON. If E.ON consider anything here to infringe, open an issue and it will be addressed.
-
-## Credits
-
-Developed by [@fezvrasta](https://github.com/fezvrasta)
