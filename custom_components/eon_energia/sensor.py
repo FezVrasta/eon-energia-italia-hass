@@ -13,7 +13,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CURRENCY_EURO, UnitOfEnergy
+from homeassistant.const import CURRENCY_EURO, UnitOfEnergy, UnitOfPower
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -54,6 +54,17 @@ async def async_setup_entry(
         EONEnergiaTotalInvoicedSensor(invoice_coordinator, entry, pod),
     ]
 
+    # Contract facts, from the supply detail fetched at setup. Absent if that
+    # call failed, in which case the entities are simply not created rather than
+    # created permanently unknown.
+    if supply := data.get("supply"):
+        entities.extend(
+            [
+                EONEnergiaContractedPowerSensor(entry, pod, supply),
+                EONEnergiaOfferEndSensor(entry, pod, supply),
+            ]
+        )
+
     # Add fascia-specific cumulative sensors for multioraria tariffs
     if tariff_type == TARIFF_MULTIORARIA:
         entities.extend([
@@ -63,6 +74,100 @@ async def async_setup_entry(
         ])
 
     async_add_entities(entities)
+
+
+class EONEnergiaSupplySensor(SensorEntity):
+    """Base for entities describing the contract rather than the consumption.
+
+    These do not use a coordinator: the underlying values change when the
+    contract does, which is roughly annually, so they are read once at setup.
+    """
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, entry: ConfigEntry, pod: str, supply, key: str) -> None:
+        """Bind to one supply."""
+        self._pod = pod
+        self._supply = supply
+        self._attr_unique_id = f"{entry.entry_id}_{pod}_{key}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, pod)},
+            "name": f"EON Energia {pod}",
+            "manufacturer": "EON Energia",
+            "model": supply.product_name or "Smart Meter",
+        }
+
+
+class EONEnergiaContractedPowerSensor(EONEnergiaSupplySensor):
+    """The power the contract is sold at."""
+
+    _attr_translation_key = "contracted_power"
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
+
+    def __init__(self, entry: ConfigEntry, pod: str, supply) -> None:
+        """Initialise."""
+        super().__init__(entry, pod, supply, "contracted_power")
+
+    @property
+    def native_value(self) -> float | None:
+        """Contracted power, in kW."""
+        return self._supply.contractual_power
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """The numbers that matter alongside it.
+
+        `available_power` is the one the meter actually trips at: Italian supplies
+        tolerate about 10% over the contracted figure before disconnecting.
+        """
+        return {
+            k: v
+            for k, v in {
+                "available_power": self._supply.available_power,
+                "voltage": self._supply.voltage,
+                "distributor": self._supply.distributor,
+                "distributor_emergency_phone": self._supply.distributor_emergency_phone,
+                "usage_type": self._supply.usage_type,
+                "tariff_bands": self._supply.tariff_bands,
+                "market_type": self._supply.market_type,
+                "annual_consumption": self._supply.annual_consumption,
+            }.items()
+            if v is not None
+        }
+
+
+class EONEnergiaOfferEndSensor(EONEnergiaSupplySensor):
+    """When the current offer expires.
+
+    Worth surfacing: Italian retail offers are fixed-term, and the tariff after
+    one lapses is rarely the one you would have chosen.
+    """
+
+    _attr_translation_key = "offer_end"
+    _attr_device_class = SensorDeviceClass.DATE
+
+    def __init__(self, entry: ConfigEntry, pod: str, supply) -> None:
+        """Initialise."""
+        super().__init__(entry, pod, supply, "offer_end")
+
+    @property
+    def native_value(self) -> date | None:
+        """The offer's end date."""
+        return self._supply.contract_end
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Product identity and how long is left."""
+        attrs: dict[str, Any] = {}
+        if self._supply.product_name:
+            attrs["product"] = self._supply.product_name
+        if self._supply.contract_start:
+            attrs["contract_start"] = self._supply.contract_start.isoformat()
+        if self._supply.contract_end:
+            attrs["days_remaining"] = (self._supply.contract_end - date.today()).days
+        return attrs
 
 
 class EONEnergiaBaseSensor(CoordinatorEntity, SensorEntity):
@@ -548,6 +653,12 @@ class EONEnergiaLatestInvoiceSensor(CoordinatorEntity, SensorEntity):
             attrs["payment_status"] = invoice.payment_status
             attrs["amount_paid"] = invoice.paid
             attrs["amount_remaining"] = invoice.outstanding
+            attrs["payment_method"] = invoice.payment_method
+            attrs["direct_debit"] = invoice.is_direct_debit
+            attrs["instalment_plan"] = invoice.instalment_plan
+            # pagoPA identifiers, so the bill can be paid without logging in
+            attrs["pagopa_iuv"] = invoice.iuv
+            attrs["payment_codeline"] = invoice.codeline
 
             # Get period and amount from ListaForniture if available
             forniture = invoice.raw.get("ListaForniture", [])
@@ -555,8 +666,19 @@ class EONEnergiaLatestInvoiceSensor(CoordinatorEntity, SensorEntity):
                 codice_fornitura = fornitura.get("CodiceFornitura", "")
                 codice_pdr_pod = fornitura.get("CodicePDR_POD", "")
                 if self._pod in (codice_fornitura, codice_pdr_pod):
-                    attrs["billing_period_start"] = fornitura.get("PeriodoCompetenzaInizio") or fornitura.get("DataInizio")
-                    attrs["billing_period_end"] = fornitura.get("PeriodoCompetenzaFine") or fornitura.get("DataFine")
+                    # The per-supply entry usually omits the competence period,
+                    # which the invoice itself carries, so fall back to that
+                    # rather than reporting None for a date E.ON did send.
+                    attrs["billing_period_start"] = (
+                        fornitura.get("PeriodoCompetenzaInizio")
+                        or fornitura.get("DataInizio")
+                        or (invoice.period_start.isoformat() if invoice.period_start else None)
+                    )
+                    attrs["billing_period_end"] = (
+                        fornitura.get("PeriodoCompetenzaFine")
+                        or fornitura.get("DataFine")
+                        or (invoice.period_end.isoformat() if invoice.period_end else None)
+                    )
                     attrs["pod_amount"] = fornitura.get("ImportoFornitura") or fornitura.get("Importo")
                     break
 
@@ -638,6 +760,9 @@ class EONEnergiaInvoicePaymentStatusSensor(CoordinatorEntity, SensorEntity):
             attrs["amount_paid"] = invoice.paid
             attrs["amount_remaining"] = invoice.outstanding
             attrs["raw_status"] = invoice.payment_status
+            attrs["payment_method"] = invoice.payment_method
+            # The difference between owing money and having to go and pay it.
+            attrs["direct_debit"] = invoice.is_direct_debit
 
         return attrs
 

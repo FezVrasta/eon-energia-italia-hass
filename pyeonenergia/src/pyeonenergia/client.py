@@ -17,12 +17,20 @@ from .exceptions import (
     EonEnergiaApiError,
     EonEnergiaAuthError,
 )
-from .models import Account, HourlyConsumption, Invoice, PointOfDelivery
+from .models import (
+    Account,
+    BillingProfile,
+    HourlyConsumption,
+    Invoice,
+    PointOfDelivery,
+)
 from .const import (
     AUTH_CLIENT_ID,
     AUTH_TOKEN_URL,
     ENDPOINT_DAILY_CONSUMPTION,
     ENDPOINT_ACCOUNTS,
+    ENDPOINT_BILLING_PROFILES,
+    ENDPOINT_DISCONNECTION,
     ENDPOINT_POINT_OF_DELIVERIES,
     ENDPOINT_INVOICES,
     ENDPOINT_ENERGY_WALLET,
@@ -364,6 +372,34 @@ class EonEnergiaClient:
         """Return every metering point on the account."""
         payload = await self._request("GET", ENDPOINT_POINT_OF_DELIVERIES)
         return [PointOfDelivery.from_api(item) for item in payload or []]
+
+    async def get_point_of_delivery(self, pod: str) -> PointOfDelivery:
+        """Return one metering point in full.
+
+        The list endpoint gives identity and address; this one adds the contract:
+        contracted and available power, the distributor, the product and when the
+        offer ends.
+        """
+        payload = await self._request(
+            "GET", f"{ENDPOINT_POINT_OF_DELIVERIES}/{pod}"
+        )
+        return PointOfDelivery.from_api(payload or {})
+
+    async def get_billing_profiles(self) -> list[BillingProfile]:
+        """Return how each supply is billed and paid."""
+        payload = await self._request("GET", ENDPOINT_BILLING_PROFILES)
+        return [BillingProfile.from_api(item) for item in payload or []]
+
+    async def get_disconnection_status(self, pod: str) -> dict[str, Any]:
+        """Return whether a supply-termination request can be submitted.
+
+        Despite the name this is not a warning that the supply is about to be cut
+        off. It backs the app's "terminate this contract" flow and answers whether
+        that request would be accepted, so a positive answer is unremarkable.
+        """
+        return await self._request(
+            "GET", ENDPOINT_DISCONNECTION, params={"PODID": pod}
+        )
 
     async def get_daily_consumption(
         self,

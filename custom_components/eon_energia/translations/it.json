@@ -155,6 +155,17 @@
       },
       "total_invoiced": {
         "name": "Totale Fatturato"
+      },
+      "contracted_power": {
+        "name": "Potenza impegnata"
+      },
+      "offer_end": {
+        "name": "Scadenza offerta"
+      }
+    },
+    "binary_sensor": {
+      "termination_available": {
+        "name": "Disalimentazione possibile"
       }
     }
   }

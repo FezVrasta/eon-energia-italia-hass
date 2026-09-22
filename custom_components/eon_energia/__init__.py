@@ -29,6 +29,7 @@ from pyeonenergia import (
     EonEnergiaApiError,
     EonEnergiaAuthError,
     EonEnergiaClient,
+    PointOfDelivery,
     fascia_for_hour,
     hour_start_for_field,
     is_italian_holiday,
@@ -47,7 +48,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
 # Fixed Italian national holidays (month, day)
 
@@ -260,8 +261,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Fetch initial consumption data (will now include cost statistics if price was calculated)
     await coordinator.async_config_entry_first_refresh()
 
+    # The contract behind this supply: contracted power, distributor, product and
+    # when the offer ends. It changes about once a year, so it is fetched at setup
+    # rather than polled, and a failure here must not block the integration.
+    supply: PointOfDelivery | None = None
+    try:
+        supply = await api.get_point_of_delivery(pod)
+        _LOGGER.debug(
+            "Supply %s: %s, %s kW contracted, offer ends %s",
+            pod,
+            supply.product_name,
+            supply.contractual_power,
+            supply.contract_end,
+        )
+    except EonEnergiaApiError as err:
+        _LOGGER.warning("Could not fetch supply details for %s: %s", pod, err)
+
     hass.data[DOMAIN][entry.entry_id] = {
         "api": api,
+        "supply": supply,
         "coordinator": coordinator,
         "invoice_coordinator": invoice_coordinator,
         "pod": pod,

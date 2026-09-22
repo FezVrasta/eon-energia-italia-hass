@@ -27,6 +27,13 @@ def _text(payload: dict[str, Any], *keys: str) -> str | None:
     return None
 
 
+def _datetime_date(value: str | None) -> date | None:
+    """Parse E.ON's `DD/MM/YYYY HH:MM:SS.mmm`, keeping only the date."""
+    if not value:
+        return None
+    return parse_italian_date(value.split(" ")[0])
+
+
 def _number(payload: dict[str, Any], *keys: str) -> float | None:
     """Return the first key present that parses as a number.
 
@@ -97,11 +104,25 @@ class PointOfDelivery:
     commodity: str | None
     status: str | None
     address: str | None
+    # Everything below only comes back from the per-POD detail endpoint; the list
+    # endpoint leaves them None.
+    contractual_power: float | None = None
+    available_power: float | None = None
+    voltage: float | None = None
+    distributor: str | None = None
+    distributor_emergency_phone: str | None = None
+    annual_consumption: float | None = None
+    usage_type: str | None = None
+    product_name: str | None = None
+    contract_start: date | None = None
+    contract_end: date | None = None
+    tariff_bands: str | None = None
+    market_type: str | None = None
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
     @classmethod
     def from_api(cls, payload: dict[str, Any]) -> PointOfDelivery:
-        """Build from one entry of the point-of-deliveries response."""
+        """Build from the list response, or from the richer per-POD detail."""
         installation = payload.get("Installation") or {}
         delivery = payload.get("DeliveryAddress") or {}
         street = " ".join(
@@ -118,6 +139,9 @@ class PointOfDelivery:
             for part in (_text(delivery, "ZIPCode"), _text(delivery, "City"))
             if part
         )
+        tech = payload.get("TechDataElectricity") or {}
+        product = payload.get("ProductInformation") or {}
+
         return cls(
             pod_id=_text(payload, "PODID", "PRID"),
             account_id=_text(payload, "AccountID"),
@@ -126,6 +150,18 @@ class PointOfDelivery:
             commodity=_text(installation, "Type"),
             status=_text(installation, "Status"),
             address=", ".join(part for part in (street, city) if part) or None,
+            contractual_power=_number(tech, "ContractualPower"),
+            available_power=_number(tech, "AvailablePower"),
+            voltage=_number(tech, "Tension"),
+            distributor=_text(tech, "DSO"),
+            distributor_emergency_phone=_text(tech, "DSOEmergencyPhoneNumber"),
+            annual_consumption=_number(tech, "YearConsumption"),
+            usage_type=_text(tech, "UsageType"),
+            product_name=_text(product, "Name"),
+            contract_start=_datetime_date(_text(product, "StartDate")),
+            contract_end=_datetime_date(_text(product, "EndDate")),
+            tariff_bands=_text(installation, "Fasce"),
+            market_type=_text(installation, "TipoMercato"),
             raw=payload,
         )
 
@@ -133,6 +169,15 @@ class PointOfDelivery:
     def is_active(self) -> bool:
         """Whether the supply is currently live."""
         return (self.status or "").upper() == "ACTIVE"
+
+    @property
+    def is_multi_band(self) -> bool:
+        """Whether the contract is banded (F1/F2/F3) rather than a flat rate.
+
+        E.ON describe this as "3 fasce AEEG". Worth reading rather than asking
+        the user, who often does not know.
+        """
+        return "fasce" in (self.tariff_bands or "").lower()
 
     @property
     def is_electricity(self) -> bool:
@@ -157,6 +202,11 @@ class Invoice:
     period_end: date | None
     payment_status: str | None
     document_type: str | None
+    payment_method: str | None = None
+    instalment_plan: bool = False
+    #: pagoPA identifiers, for paying the thing without logging in.
+    iuv: str | None = None
+    codeline: str | None = None
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
     @classmethod
@@ -176,6 +226,10 @@ class Invoice:
             period_end=parse_italian_date(_text(payload, "PeriodoCompetenzaFine")),
             payment_status=_text(payload, "StatoPagamento", "StatoDocumento"),
             document_type=_text(payload, "TipoDocumento"),
+            payment_method=_text(payload, "ModalitaPagamento"),
+            instalment_plan=(_text(payload, "Rateizzato") or "N").upper() == "S",
+            iuv=_text(payload, "codiceIUV"),
+            codeline=_text(payload, "codeline"),
             raw=payload,
         )
 
@@ -183,6 +237,15 @@ class Invoice:
     def is_paid(self) -> bool:
         """Whether E.ON consider this settled."""
         return (self.payment_status or "").upper() not in ("NOT_PAID", "UNPAID", "")
+
+    @property
+    def is_direct_debit(self) -> bool:
+        """Whether this will be collected automatically.
+
+        The difference between "you owe money" and "you owe money and must go and
+        pay it", which is the only version worth alerting anyone about.
+        """
+        return (self.payment_method or "").upper() in ("RID", "SDD", "DIRECT_DEBIT")
 
     @property
     def billing_month(self) -> str | None:
@@ -269,3 +332,40 @@ class HourlyConsumption:
             if start is not None:
                 out.append((hour, start, value))
         return out
+
+
+@dataclass(slots=True)
+class BillingProfile:
+    """How one supply is billed and paid.
+
+    The response also carries the direct-debit IBAN and the account holder's name.
+    Neither is modelled: nothing downstream needs a bank account number, and a
+    field that exists is a field that ends up in a diagnostics dump. Use `.raw` if
+    you genuinely need it.
+    """
+
+    profile_id: str | None
+    commodity: str | None
+    status: str | None
+    payment_method: str | None
+    invoice_delivery_method: str | None
+    raw: dict[str, Any] = field(repr=False, default_factory=dict)
+
+    @classmethod
+    def from_api(cls, payload: dict[str, Any]) -> BillingProfile:
+        """Build from one entry of the billing-profiles response."""
+        payment = payload.get("PaymentMethod") or {}
+        delivery = payload.get("InvoiceDeliveryMethod") or {}
+        return cls(
+            profile_id=_text(payload, "BillingProfileID"),
+            commodity=_text(payload, "Commodity"),
+            status=_text(payload, "Status"),
+            payment_method=_text(payment, "PaymentMethod"),
+            invoice_delivery_method=_text(delivery, "DeliveryMethod"),
+            raw=payload,
+        )
+
+    @property
+    def is_direct_debit(self) -> bool:
+        """Whether invoices on this profile are collected automatically."""
+        return (self.payment_method or "").upper() in ("RID", "SDD", "DIRECT_DEBIT")

@@ -51,7 +51,13 @@ from .exceptions import (
     EonEnergiaMfaRequiredError,
     EonEnergiaTokenRefreshError,
 )
-from .models import Account, HourlyConsumption, Invoice, PointOfDelivery
+from .models import (
+    Account,
+    BillingProfile,
+    HourlyConsumption,
+    Invoice,
+    PointOfDelivery,
+)
 from .tariff import (
     ITALY,
     easter_sunday,
@@ -83,6 +89,7 @@ __all__ = [
     "TARIFF_MONORARIA",
     "TARIFF_MULTIORARIA",
     "Account",
+    "BillingProfile",
     "EonEnergiaApiError",
     "EonEnergiaAuth",
     "EonEnergiaAuthError",

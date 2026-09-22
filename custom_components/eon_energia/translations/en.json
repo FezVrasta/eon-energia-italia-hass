@@ -155,6 +155,17 @@
       },
       "total_invoiced": {
         "name": "Total Invoiced"
+      },
+      "contracted_power": {
+        "name": "Contracted power"
+      },
+      "offer_end": {
+        "name": "Offer ends"
+      }
+    },
+    "binary_sensor": {
+      "termination_available": {
+        "name": "Termination available"
       }
     }
   }

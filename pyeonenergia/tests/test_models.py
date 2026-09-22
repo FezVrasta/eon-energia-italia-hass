@@ -10,7 +10,13 @@ from __future__ import annotations
 
 from datetime import date
 
-from pyeonenergia import Account, HourlyConsumption, Invoice, PointOfDelivery
+from pyeonenergia import (
+    Account,
+    BillingProfile,
+    HourlyConsumption,
+    Invoice,
+    PointOfDelivery,
+)
 
 POD_PAYLOAD = {
     "PODID": "10030006784668",
@@ -34,6 +40,41 @@ POD_PAYLOAD = {
     "CreateDate": "18/07/2017 13:51:02.000",
 }
 
+# The per-POD detail endpoint, which carries the contract. The list endpoint
+# returns none of this.
+POD_DETAIL_PAYLOAD = {
+    **POD_PAYLOAD,
+    "Installation": {
+        **POD_PAYLOAD["Installation"],
+        "Fasce": "3 fasce AEEG",
+        "TipoMercato": "Libero",
+    },
+    "TechDataElectricity": {
+        "AvailablePower": "6.6",
+        "ContractualPower": "6.0",
+        "Tension": "220",
+        "DSO": "e-distribuzione S.p.A.",
+        "DSOEmergencyPhoneNumber": "803.500",
+        "YearConsumption": "3504.0",
+        "UsageType": "RESIDENTIAL",
+    },
+    "ProductInformation": {
+        "ID": "L61AD5U_D_A_CLSA",
+        "Name": "E.ON LuceClick - Amico new",
+        "StartDate": "15/09/2025 00:00:00.000",
+        "EndDate": "30/09/2026 00:00:00.000",
+    },
+}
+
+BILLING_PROFILE_PAYLOAD = {
+    "BillingProfileID": "PF-7293939",
+    "Commodity": "POWER",
+    "Status": "ACTIVE",
+    "IBAN": "IT00X0000000000000000000000",
+    "InvoiceDeliveryMethod": {"Email": "someone@example.com", "DeliveryMethod": "EMAIL"},
+    "PaymentMethod": {"PaymentMethod": "DIRECT_DEBIT", "DirectDebitOwnerName": "FEDERICO"},
+}
+
 INVOICE_PAYLOAD = {
     "AccountID": "A305402184",
     "BillingProfile": "PF-7293939",
@@ -50,6 +91,9 @@ INVOICE_PAYLOAD = {
     "StatoPagamento": "NOT_PAID",
     "ImportoPagato": "0.00",
     "ImportoResiduo": "98.00",
+    "Rateizzato": "N",
+    "codeline": "9000000050415699",
+    "codiceIUV": "300260301248813077",
     "ListaForniture": [{"CodiceFornitura": "10030006784668"}],
 }
 
@@ -187,3 +231,70 @@ class TestAccount:
         account = Account.from_api({})
         assert account.account_id is None
         assert account.full_name is None
+
+
+class TestSupplyDetail:
+    def test_the_list_endpoint_leaves_contract_fields_empty(self):
+        # Only the per-POD endpoint carries them; nothing should invent a value.
+        pod = PointOfDelivery.from_api(POD_PAYLOAD)
+        assert pod.contractual_power is None
+        assert pod.contract_end is None
+        assert pod.distributor is None
+
+    def test_the_detail_endpoint_fills_them_in(self):
+        pod = PointOfDelivery.from_api(POD_DETAIL_PAYLOAD)
+        assert pod.contractual_power == 6.0
+        assert pod.available_power == 6.6
+        assert pod.voltage == 220.0
+        assert pod.distributor == "e-distribuzione S.p.A."
+        assert pod.annual_consumption == 3504.0
+        assert pod.usage_type == "RESIDENTIAL"
+        assert pod.product_name == "E.ON LuceClick - Amico new"
+
+    def test_contract_dates_drop_the_time_part(self):
+        # E.ON send "15/09/2025 00:00:00.000", not a bare date.
+        pod = PointOfDelivery.from_api(POD_DETAIL_PAYLOAD)
+        assert pod.contract_start == date(2025, 9, 15)
+        assert pod.contract_end == date(2026, 9, 30)
+
+    def test_banded_tariff_is_read_rather_than_asked(self):
+        assert PointOfDelivery.from_api(POD_DETAIL_PAYLOAD).is_multi_band
+        flat = {
+            **POD_DETAIL_PAYLOAD,
+            "Installation": {**POD_DETAIL_PAYLOAD["Installation"], "Fasce": "Monoraria"},
+        }
+        assert not PointOfDelivery.from_api(flat).is_multi_band
+
+
+class TestInvoicePayment:
+    def test_payment_method_and_pagopa_codes(self):
+        invoice = Invoice.from_api(INVOICE_PAYLOAD)
+        assert invoice.payment_method == "RID"
+        assert invoice.is_direct_debit
+        assert invoice.iuv == "300260301248813077"
+        assert invoice.codeline == "9000000050415699"
+        assert not invoice.instalment_plan
+
+    def test_a_bill_you_must_go_and_pay(self):
+        invoice = Invoice.from_api({**INVOICE_PAYLOAD, "ModalitaPagamento": "BOLLETTINO"})
+        assert not invoice.is_direct_debit
+
+    def test_instalment_plan_is_flagged(self):
+        assert Invoice.from_api({**INVOICE_PAYLOAD, "Rateizzato": "S"}).instalment_plan
+
+
+class TestBillingProfile:
+    def test_reads_payment_and_delivery(self):
+        profile = BillingProfile.from_api(BILLING_PROFILE_PAYLOAD)
+        assert profile.profile_id == "PF-7293939"
+        assert profile.payment_method == "DIRECT_DEBIT"
+        assert profile.invoice_delivery_method == "EMAIL"
+        assert profile.is_direct_debit
+
+    def test_the_iban_is_not_modelled(self):
+        # It is in the response and stays in raw, but nothing downstream should
+        # be able to pick up a bank account number by accident.
+        profile = BillingProfile.from_api(BILLING_PROFILE_PAYLOAD)
+        assert "IBAN" not in {f for f in profile.__slots__}
+        assert "IT00X" not in repr(profile)
+        assert profile.raw["IBAN"].startswith("IT00X")

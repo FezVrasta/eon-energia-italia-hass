@@ -24,6 +24,10 @@ ENDPOINT_ACCOUNTS = "/scsi/accounts/v1.0"
 ENDPOINT_POINT_OF_DELIVERIES = "/scsi/point-of-deliveries/v1.0"
 ENDPOINT_INVOICES = "/scsi/invoices/v1.0/getInvoiceDvc"
 ENDPOINT_ENERGY_WALLET = "/energyWalletMyEon/v1.0/energyWallet"
+ENDPOINT_BILLING_PROFILES = "/scsi/billing-profiles/v1.0"
+#: Answers whether a termination request can be submitted, not whether the supply
+#: is at risk of being cut off. See EonEnergiaClient.get_disconnection_status.
+ENDPOINT_DISCONNECTION = "/Disalimentazione/v1.0/GetDisalimentazione"
 
 # Measurement types.
 MEASURE_TYPE_EA = "Ea"  # Active energy
