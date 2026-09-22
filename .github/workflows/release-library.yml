@@ -1,0 +1,152 @@
+name: Release library
+
+# Two release trains live in this repository and they are deliberately separate:
+#
+#   vX.Y.Z               the Home Assistant integration, served by HACS from the
+#                        tagged commit
+#   pyeonenergia-vX.Y.Z  the protocol library, published to PyPI
+#
+# The integration pins the library exactly, so the library ships first and the
+# integration release that depends on it follows.
+
+on:
+  push:
+    tags: ["pyeonenergia-v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the tag prefix (e.g. 0.1.0)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Work out the version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#pyeonenergia-v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building pyeonenergia $VERSION"
+
+      # Same rule as manifest.json: the version comes from the tag, never from a
+      # hand edit. Written before the build so the artefact carries it.
+      - name: Set the version from the tag
+        run: |
+          python3 - "${{ steps.version.outputs.version }}" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          version = sys.argv[1]
+          targets = {
+              "pyeonenergia/pyproject.toml": r'^version = ".*"$',
+              "pyeonenergia/src/pyeonenergia/__init__.py": r'^__version__ = ".*"$',
+          }
+          replacements = {
+              "pyeonenergia/pyproject.toml": f'version = "{version}"',
+              "pyeonenergia/src/pyeonenergia/__init__.py": f'__version__ = "{version}"',
+          }
+          for path, pattern in targets.items():
+              file = pathlib.Path(path)
+              text, count = re.subn(
+                  pattern, replacements[path], file.read_text(), count=1, flags=re.M
+              )
+              if count != 1:
+                  sys.exit(f"could not find a version line in {path}")
+              file.write_text(text)
+              print(f"{path} -> {version}")
+          PY
+
+      - name: Run the tests against what is about to ship
+        run: |
+          pip install ./pyeonenergia[test]
+          python -m pytest pyeonenergia/tests -q
+
+      - name: Build sdist and wheel
+        run: |
+          pip install build twine
+          python -m build pyeonenergia
+          twine check pyeonenergia/dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: pyeonenergia/dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # Trusted publishing: PyPI verifies this workflow's OIDC token, so there is
+    # no API token to store or rotate. Configure the publisher once at
+    # https://pypi.org/manage/account/publishing/ with owner FezVrasta,
+    # repository eon-energia-italia-hass, workflow release-library.yml,
+    # environment pypi.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pyeonenergia
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  sync:
+    name: Commit the version back
+    # Both, not just publish: the `needs` context only exposes the jobs a job
+    # actually lists, so naming publish alone leaves needs.build.outputs.version
+    # empty and the sed below writes version = "" back to main.
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set the version from the tag
+        run: |
+          VERSION="${{ needs.build.outputs.version }}"
+          # A blank version here would rewrite both files to version = "" and
+          # commit it, leaving main unbuildable. Never sed on an empty.
+          [ -n "$VERSION" ] || { echo "::error::empty version"; exit 1; }
+          sed -i "0,/^version = \".*\"$/s//version = \"$VERSION\"/" \
+            pyeonenergia/pyproject.toml
+          sed -i "0,/^__version__ = \".*\"$/s//__version__ = \"$VERSION\"/" \
+            pyeonenergia/src/pyeonenergia/__init__.py
+          grep -q "^version = \"$VERSION\"$" pyeonenergia/pyproject.toml
+
+      - name: Commit if it changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyeonenergia/pyproject.toml pyeonenergia/src/pyeonenergia/__init__.py
+          git diff --staged --quiet || {
+            git commit -m "Set pyeonenergia version to ${{ needs.build.outputs.version }}"
+            git push
+          }
