@@ -133,8 +133,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     password = entry.data.get(CONF_PASSWORD)
 
     def token_refresh_callback(new_access_token: str, new_refresh_token: str) -> None:
-        """Handle token refresh by updating the config entry."""
-        _LOGGER.info("Tokens refreshed, updating config entry")
+        """Persist rotated tokens without reloading the entry.
+
+        async_update_entry fires the update listener, which reloads the whole
+        integration and re-imports several days of statistics. That was tolerable
+        when a refresh was a rare event; tokens are now refreshed shortly before
+        they expire, so it would happen every couple of hours. Flag the entry so
+        async_reload_entry knows this particular update is only the tokens.
+        """
+        _LOGGER.debug("Tokens refreshed, updating config entry")
+        hass.data[DOMAIN].setdefault("token_only_updates", set()).add(entry.entry_id)
         new_data = {
             **entry.data,
             CONF_ACCESS_TOKEN: new_access_token,
@@ -309,7 +317,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload config entry when options change."""
+    """Reload the config entry when its options change.
+
+    Skips the reload when the change was only a rotated token, which the
+    coordinator writes back routinely and which nothing needs reloading for.
+    """
+    pending = hass.data.get(DOMAIN, {}).get("token_only_updates")
+    if pending and entry.entry_id in pending:
+        pending.discard(entry.entry_id)
+        _LOGGER.debug("Config entry updated with refreshed tokens, not reloading")
+        return
+
     await hass.config_entries.async_reload(entry.entry_id)
 
 
