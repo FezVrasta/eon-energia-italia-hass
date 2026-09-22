@@ -18,6 +18,8 @@ import re
 import time
 
 import aiohttp
+
+from .exceptions import EonEnergiaConfigError
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
@@ -74,10 +76,6 @@ FALLBACK_CACHE_TTL = 3600
 _cached_config: dict[str, str] | None = None
 _cache_timestamp: float = 0.0
 _cache_lock: asyncio.Lock | None = None
-
-
-class ApiConfigError(Exception):
-    """Error fetching or extracting API configuration."""
 
 
 def _unseal() -> dict[str, str]:
@@ -144,7 +142,7 @@ async def get_api_config(
         try:
             config = await _fetch_api_config(session)
             ttl_from = now
-        except (ApiConfigError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+        except (EonEnergiaConfigError, aiohttp.ClientError, asyncio.TimeoutError) as err:
             # The website is unreachable (Cloudflare challenge, outage, DNS).
             # This must not take the integration down: the values change very
             # rarely and we know what they are.
@@ -201,7 +199,7 @@ async def _fetch_api_config(
         # one is not a visible failure: the API accepts the request and answers
         # HTTP 500. A known-good constant beats a confident guess, so let the
         # caller fall back instead.
-        raise ApiConfigError(
+        raise EonEnergiaConfigError(
             "Config JS unavailable (site is behind Cloudflare or the path moved)"
         )
 
@@ -210,7 +208,7 @@ async def _fetch_api_config(
             MYEON_LOGIN_URL, headers=headers, allow_redirects=True
         ) as response:
             if response.status != 200:
-                raise ApiConfigError(
+                raise EonEnergiaConfigError(
                     f"Failed to fetch EON website: HTTP {response.status}"
                 )
             html_content = await response.text()
@@ -218,14 +216,14 @@ async def _fetch_api_config(
         # Extract API base URL from HTML
         base_url = _extract_api_url_from_html(html_content)
         if not base_url:
-            raise ApiConfigError("API base URL not found in login page")
+            raise EonEnergiaConfigError("API base URL not found in login page")
 
         _LOGGER.debug("Extracted API base URL: %s", base_url)
 
         # Find JavaScript file URLs
         js_urls = _extract_js_urls(html_content)
         if not js_urls:
-            raise ApiConfigError("No JavaScript files found on EON website")
+            raise EonEnergiaConfigError("No JavaScript files found on EON website")
 
         _LOGGER.debug("Found %d JavaScript files to search", len(js_urls))
 
@@ -254,7 +252,7 @@ async def _fetch_api_config(
                 continue
 
         if not subscription_key:
-            raise ApiConfigError(
+            raise EonEnergiaConfigError(
                 "Subscription key not found in any JavaScript file"
             )
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 import voluptuous as vol
@@ -25,7 +25,15 @@ from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .api import EONEnergiaApi, EONEnergiaApiError, EONEnergiaAuthError
+from pyeonenergia import (
+    EonEnergiaApiError,
+    EonEnergiaAuthError,
+    EonEnergiaClient,
+    fascia_for_hour,
+    hour_start_for_field,
+    is_italian_holiday,
+    parse_italian_date,
+)
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_POD,
@@ -42,62 +50,12 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 # Fixed Italian national holidays (month, day)
-ITALIAN_HOLIDAYS_FIXED = [
-    (1, 1),    # Capodanno (New Year's Day)
-    (1, 6),    # Epifania (Epiphany)
-    (4, 25),   # Festa della Liberazione (Liberation Day)
-    (5, 1),    # Festa dei Lavoratori (Labour Day)
-    (6, 2),    # Festa della Repubblica (Republic Day)
-    (8, 15),   # Ferragosto (Assumption of Mary)
-    (11, 1),   # Ognissanti (All Saints' Day)
-    (12, 8),   # Immacolata Concezione (Immaculate Conception)
-    (12, 25),  # Natale (Christmas Day)
-    (12, 26),  # Santo Stefano (St. Stephen's Day)
-]
 
 
-def _calculate_easter(year: int) -> date:
-    """Calculate Easter Sunday for a given year using Anonymous Gregorian algorithm."""
-    a = year % 19
-    b = year // 100
-    c = year % 100
-    d = b // 4
-    e = b % 4
-    f = (b + 8) // 25
-    g = (b - f + 1) // 3
-    h = (19 * a + b - d - g + 15) % 30
-    i = c // 4
-    k = c % 4
-    l = (32 + 2 * e + 2 * i - h - k) % 7
-    m = (a + 11 * h + 22 * l) // 451
-    month = (h + l - 7 * m + 114) // 31
-    day = ((h + l - 7 * m + 114) % 31) + 1
-    return date(year, month, day)
 
 
-def _is_italian_holiday(dt: datetime) -> bool:
-    """Check if a date is an Italian national holiday."""
-    # Check fixed holidays
-    if (dt.month, dt.day) in ITALIAN_HOLIDAYS_FIXED:
-        return True
-
-    # Check Easter Monday (Pasquetta) - the only moving holiday on a weekday
-    easter = _calculate_easter(dt.year)
-    easter_monday = easter + timedelta(days=1)
-    if dt.month == easter_monday.month and dt.day == easter_monday.day:
-        return True
-
-    return False
 
 
-def _parse_italian_date(date_str: str | None) -> date | None:
-    """Parse Italian date format DD/MM/YYYY."""
-    if not date_str:
-        return None
-    try:
-        return datetime.strptime(date_str, "%d/%m/%Y").date()
-    except ValueError:
-        return None
 
 
 def _get_price_for_date(
@@ -150,7 +108,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         }
         hass.config_entries.async_update_entry(entry, data=new_data)
 
-    api = EONEnergiaApi(
+    api = EonEnergiaClient(
         access_token=access_token,
         refresh_token=refresh_token,
         token_callback=token_refresh_callback,
@@ -188,7 +146,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     if data and len(data) > 0:
                         return [data[0] if isinstance(data, list) else data]
                 return []
-            except EONEnergiaApiError:
+            except EonEnergiaApiError:
                 return []
 
         try:
@@ -222,7 +180,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             days_to_import = []
             for target_date, day_data in all_data:
                 date_str = target_date.strftime("%Y-%m-%d")
-                data_date = day_data.get("data", date_str)
+                data_date = day_data.day.isoformat() if day_data.day else date_str
 
                 # Skip if we've already imported this date
                 if import_state["last_date"] and data_date <= import_state["last_date"]:
@@ -237,16 +195,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             # Update the last imported date (use last item = most recent)
             if all_data:
-                import_state["last_date"] = all_data[-1][1].get(
-                    "data", all_data[-1][0].strftime("%Y-%m-%d")
+                last_target, last_reading = all_data[-1]
+                import_state["last_date"] = (
+                    last_reading.day.isoformat()
+                    if last_reading.day
+                    else last_target.strftime("%Y-%m-%d")
                 )
 
             # Return the most recent day's data for the sensors
             return [most_recent_data]
 
-        except EONEnergiaAuthError as err:
+        except EonEnergiaAuthError as err:
             raise UpdateFailed(f"Authentication failed: {err}") from err
-        except EONEnergiaApiError as err:
+        except EonEnergiaApiError as err:
             raise UpdateFailed(f"Error communicating with API: {err}") from err
 
     # Invoice coordinator (updates less frequently)
@@ -264,9 +225,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 await _import_invoice_cost_statistics(hass, api, invoices, pod)
 
             return invoices
-        except EONEnergiaAuthError as err:
+        except EonEnergiaAuthError as err:
             raise UpdateFailed(f"Authentication failed: {err}") from err
-        except EONEnergiaApiError as err:
+        except EonEnergiaApiError as err:
             raise UpdateFailed(f"Error fetching invoices: {err}") from err
 
     invoice_coordinator = DataUpdateCoordinator(
@@ -556,42 +517,8 @@ MIN_DERIVED_PRICE = 0.05
 MAX_DERIVED_PRICE = 1.50
 
 
-def _local_hour_starts(day: datetime) -> list[datetime]:
-    """Return every hour start in a local calendar day.
-
-    Usually 24, but 23 on the spring-forward day and 25 on the autumn one.
-
-    The obvious `start_of_local_day(day) + timedelta(hours=n)` is wrong on those
-    two days: timedelta arithmetic on an aware datetime is absolute, so once the
-    offset changes every later hour is displaced by one. In October that put two
-    of E.ON's hourly readings on the same instant, and the second silently
-    overwrote the first while its value had already been added to the running
-    total - a real double count, visible in the data as an hour whose cumulative
-    delta was exactly twice its own value.
-    """
-    # Step in UTC, not local time. Adding a timedelta to an aware datetime is
-    # wall-clock arithmetic in Python: it bumps the naive fields and keeps the
-    # same tzinfo, so iterating locally yields 24 hours on every day of the year
-    # and never surfaces the repeated or missing one. Converting to UTC first
-    # makes the step absolute, which is the whole point.
-    start = dt_util.start_of_local_day(day).astimezone(timezone.utc)
-    end = dt_util.start_of_local_day(day + timedelta(days=1)).astimezone(timezone.utc)
-    count = round((end - start) / timedelta(hours=1))
-    return [start + timedelta(hours=i) for i in range(count)]
 
 
-def _stat_time_for_hour(day: datetime, hour: int) -> datetime | None:
-    """Map E.ON's 1-based hour field to an instant, or None if it has none.
-
-    E.ON always ship valore_h01..valore_h24, so on a 23-hour day the last field
-    has nowhere to go, and on a 25-hour day the final hour goes unreported. Both
-    are returned honestly - a dropped field or a gap - rather than folded onto a
-    neighbouring hour.
-    """
-    hours = _local_hour_starts(day)
-    if not 1 <= hour <= len(hours):
-        return None
-    return hours[hour - 1]
 
 
 async def _import_days_batch(
@@ -660,36 +587,25 @@ async def _import_days_batch(
     # whatever is already stored, so an overlapping re-import stays monotonic.
     new_values: dict[str, dict[datetime, float]] = {key: {} for key in stat_configs}
 
-    for date, day_data in days_data:
-        for hour in range(1, 25):
-            field_key = f"valore_h{hour:02d}"
-            if field_key not in day_data:
+    for date, reading in days_data:
+        # hours() resolves E.ON's 24 fields against the real local day, so the
+        # spring-forward and autumn days come back with 23 and 24 entries rather
+        # than a collision.
+        for hour, stat_time, hourly_value in reading.hours():
+            if hourly_value <= 0:
                 continue
 
-            try:
-                hourly_value = float(day_data[field_key])
-                if hourly_value <= 0:
-                    continue
+            new_values["total"][stat_time] = hourly_value
 
-                stat_time = _stat_time_for_hour(date, hour)
-                if stat_time is None:
-                    # No such local hour on this day (spring forward).
-                    continue
+            fascia = None
+            if is_multioraria:
+                fascia = fascia_for_hour(date, hour)
+                new_values[fascia][stat_time] = hourly_value
 
-                new_values["total"][stat_time] = hourly_value
-
-                fascia = None
-                if is_multioraria:
-                    fascia = _get_fascia_for_hour(date, hour)
-                    new_values[fascia][stat_time] = hourly_value
-
-                if has_pricing:
-                    hourly_price, _ = _get_price_for_date(hass, pod, date.date(), fascia)
-                    if hourly_price:
-                        new_values["cost"][stat_time] = hourly_value * hourly_price
-
-            except (ValueError, TypeError):
-                continue
+            if has_pricing:
+                hourly_price, _ = _get_price_for_date(hass, pod, date.date(), fascia)
+                if hourly_price:
+                    new_values["cost"][stat_time] = hourly_value * hourly_price
 
     # Import all statistics at once
     for key, config in stat_configs.items():
@@ -780,40 +696,22 @@ async def _import_day_statistics(
     # been imported is then a no-op rather than a discontinuity.
     new_values: dict[str, dict[datetime, float]] = {key: {} for key in stat_configs}
 
-    for hour in range(1, 25):
-        field_key = f"valore_h{hour:02d}"
-        if field_key not in day_data:
+    for hour, stat_time, hourly_value in day_data.hours():
+        if hourly_value <= 0:
             continue
 
-        try:
-            hourly_value = float(day_data[field_key])
-            if hourly_value <= 0:
-                continue
+        new_values["total"][stat_time] = hourly_value
 
-            stat_time = _stat_time_for_hour(date, hour)
-            if stat_time is None:
-                # No such local hour on this day (spring forward).
-                continue
+        fascia = None
+        if is_multioraria:
+            fascia = fascia_for_hour(date, hour)
+            new_values[fascia][stat_time] = hourly_value
 
-            new_values["total"][stat_time] = hourly_value
-
-            # Update fascia-specific statistics
-            fascia = None
-            if is_multioraria:
-                fascia = _get_fascia_for_hour(date, hour)
-                new_values[fascia][stat_time] = hourly_value
-
-            # Update cost statistics - use date-specific pricing from invoices
-            if has_pricing:
-                hourly_price, is_from_invoice = _get_price_for_date(
-                    hass, pod, date.date(), fascia
-                )
-
-                if hourly_price:
-                    new_values["cost"][stat_time] = hourly_value * hourly_price
-
-        except (ValueError, TypeError):
-            continue
+        # Date-specific pricing, derived from the invoices
+        if has_pricing:
+            hourly_price, _ = _get_price_for_date(hass, pod, date.date(), fascia)
+            if hourly_price:
+                new_values["cost"][stat_time] = hourly_value * hourly_price
 
     # Track whether we used invoice pricing or fallback
     _, is_from_invoice = _get_price_for_date(hass, pod, date.date())
@@ -835,7 +733,7 @@ async def _import_day_statistics(
             )
             async_add_external_statistics(hass, metadata, series)
 
-    data_date = day_data.get("data", date.strftime("%Y-%m-%d"))
+    data_date = day_data.day.isoformat() if day_data.day else date.strftime("%Y-%m-%d")
     day_total = sum(new_values["total"].values())
     if has_pricing:
         _LOGGER.info(
@@ -855,38 +753,6 @@ async def _import_day_statistics(
         )
 
 
-def _get_fascia_for_hour(dt: datetime, hour: int) -> str:
-    """Determine the tariff band (fascia) for a given datetime and hour.
-
-    F1: Peak hours (Mon-Fri 8:00-19:00)
-    F2: Mid-peak hours (Mon-Fri 7:00-8:00, 19:00-23:00, Sat 7:00-23:00)
-    F3: Off-peak hours (nights 23:00-7:00, Sundays, Italian national holidays)
-
-    Note: hour is 1-24 where hour 1 = 00:00-01:00, hour 24 = 23:00-00:00
-    """
-    # Convert hour (1-24) to 0-23 format for the START of the hour period
-    hour_0_based = hour - 1
-
-    weekday = dt.weekday()  # 0=Monday, 6=Sunday
-
-    # Sundays and Italian national holidays are always F3
-    if weekday == 6 or _is_italian_holiday(dt):
-        return "F3"
-
-    # Saturday
-    if weekday == 5:
-        if 7 <= hour_0_based < 23:
-            return "F2"
-        else:
-            return "F3"
-
-    # Monday to Friday
-    if 8 <= hour_0_based < 19:
-        return "F1"
-    elif hour_0_based == 7 or 19 <= hour_0_based < 23:
-        return "F2"
-    else:
-        return "F3"
 
 
 #: The API times out server-side on long hourly ranges. A month at a time is
@@ -898,7 +764,7 @@ MIN_CHUNK_DAYS = 4
 
 
 async def _fetch_consumption_chunked(
-    api: EONEnergiaApi,
+    api: EonEnergiaClient,
     pod: str,
     start_date: datetime,
     end_date: datetime,
@@ -927,7 +793,7 @@ async def _fetch_consumption_chunked(
                 collected.extend(rows or [])
                 any_success = True
                 break
-            except EONEnergiaApiError as err:
+            except EonEnergiaApiError as err:
                 if width <= MIN_CHUNK_DAYS:
                     _LOGGER.warning(
                         "Skipping %s..%s after repeated failures: %s",
@@ -963,7 +829,7 @@ async def _fetch_consumption_chunked(
 
 async def _import_historical_statistics(
     hass: HomeAssistant,
-    api: EONEnergiaApi,
+    api: EonEnergiaClient,
     pod: str,
     days: int,
     tariff_type: str = TARIFF_MULTIORARIA,
@@ -1078,54 +944,31 @@ async def _import_historical_statistics(
     _LOGGER.info("Received %d days of consumption data", len(all_data))
 
     # Process each day's data
-    for day_data in all_data:
-        # Parse the date from the data
-        date_str = day_data.get("data")
-        if not date_str:
+    for reading in all_data:
+        if reading.day is None:
             continue
 
-        try:
-            current_date = datetime.strptime(date_str, "%Y-%m-%d")
-        except ValueError:
-            continue
-
+        date_str = reading.day.isoformat()
+        current_date = datetime.combine(reading.day, time.min)
         day_total = 0.0
 
-        # Process each hourly value
-        for hour in range(1, 25):
-            field_key = f"valore_h{hour:02d}"
-            if field_key not in day_data:
+        for hour, stat_time, hourly_value in reading.hours():
+            if hourly_value <= 0:
                 continue
 
-            try:
-                raw_value = day_data[field_key]
-                hourly_value = float(raw_value) if raw_value is not None else 0.0
+            day_total += hourly_value
+            new_values["total"][stat_time] = hourly_value
 
-                if hourly_value <= 0:
-                    continue
+            # Fascia-specific statistic (only for multioraria)
+            fascia = None
+            if is_multioraria:
+                fascia = fascia_for_hour(current_date, hour)
+                new_values[fascia][stat_time] = hourly_value
 
-                day_total += hourly_value
-
-                stat_time = _stat_time_for_hour(current_date, hour)
-                if stat_time is None:
-                    # No such local hour on this day (spring forward).
-                    continue
-
-                new_values["total"][stat_time] = hourly_value
-
-                # Fascia-specific statistic (only for multioraria)
-                fascia = None
-                if is_multioraria:
-                    fascia = _get_fascia_for_hour(current_date, hour)
-                    new_values[fascia][stat_time] = hourly_value
-
-                if has_pricing:
-                    hourly_price, _ = _get_price_for_date(hass, pod, current_date.date(), fascia)
-                    if hourly_price:
-                        new_values["cost"][stat_time] = hourly_value * hourly_price
-
-            except (ValueError, TypeError):
-                pass
+            if has_pricing:
+                hourly_price, _ = _get_price_for_date(hass, pod, current_date.date(), fascia)
+                if hourly_price:
+                    new_values["cost"][stat_time] = hourly_value * hourly_price
 
         # Store daily consumption for invoice price calculation
         if day_total > 0:
@@ -1183,7 +1026,7 @@ async def _import_historical_statistics(
 
 async def _import_invoice_cost_statistics(
     hass: HomeAssistant,
-    api: EONEnergiaApi,
+    api: EonEnergiaClient,
     invoices: list[dict[str, Any]],
     pod: str,
     daily_consumption: dict[str, float] | None = None,
@@ -1207,7 +1050,7 @@ async def _import_invoice_cost_statistics(
             start_date=start_date,
             end_date=end_date,
         )
-    except EONEnergiaApiError as err:
+    except EonEnergiaApiError as err:
         _LOGGER.error("Failed to fetch monthly consumption: %s", err)
         return
 
@@ -1233,16 +1076,15 @@ async def _import_invoice_cost_statistics(
     monthly_prices: dict[tuple[int, int], float] = {}
 
     for invoice in invoices:
-        invoice_date_str = (
-            invoice.get("DataDocumento")
-            or invoice.get("DataEmissione")
-            or invoice.get("Data")
+        # DataDocumento is not modelled; it only appears on some document types,
+        # so fall back through raw before giving up.
+        invoice_date = invoice.issued_on or parse_italian_date(
+            invoice.raw.get("DataDocumento") or invoice.raw.get("Data")
         )
-        invoice_date = _parse_italian_date(invoice_date_str)
         if not invoice_date:
             continue
 
-        forniture = invoice.get("ListaForniture", [])
+        forniture = invoice.raw.get("ListaForniture", [])
         for fornitura in forniture:
             codice_fornitura = fornitura.get("CodiceFornitura", "")
             codice_pdr_pod = fornitura.get("CodicePDR_POD", "")
@@ -1267,7 +1109,7 @@ async def _import_invoice_cost_statistics(
                     if month_kwh <= 0:
                         _LOGGER.debug(
                             "No consumption data for invoice %s month %d-%02d",
-                            invoice.get("Numero"),
+                            invoice.number,
                             target_year,
                             target_month,
                         )
@@ -1301,7 +1143,7 @@ async def _import_invoice_cost_statistics(
 
                     _LOGGER.info(
                         "Invoice %s (€%.2f) for %d-%02d: %.2f kWh -> €%.4f/kWh",
-                        invoice.get("Numero"),
+                        invoice.number,
                         amount,
                         target_year,
                         target_month,

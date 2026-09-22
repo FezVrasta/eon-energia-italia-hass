@@ -16,11 +16,14 @@ from homeassistant.config_entries import (
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import callback
 
-from .api import EONEnergiaApi, EONEnergiaApiError
-from .auth import (
-    EONAuth0Client,
-    EONAuthError,
-    EONMFARequiredError,
+from pyeonenergia import (
+    EonEnergiaApiError,
+    EonEnergiaAuth,
+    EonEnergiaAuthError,
+    EonEnergiaCaptchaError,
+    EonEnergiaClient,
+    EonEnergiaMfaRequiredError,
+    PointOfDelivery,
     build_authorization_url,
     extract_code_from_callback,
 )
@@ -74,7 +77,7 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "invalid_auth"
             else:
                 try:
-                    tokens = await EONAuth0Client.login(username, password)
+                    tokens = await EonEnergiaAuth.login(username, password)
 
                     self._access_token = tokens["access_token"]
                     self._refresh_token = tokens.get("refresh_token")
@@ -82,7 +85,7 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                     self._password = password
 
                     # Now fetch PODs
-                    api = EONEnergiaApi(
+                    api = EonEnergiaClient(
                         access_token=self._access_token,
                         refresh_token=self._refresh_token,
                     )
@@ -99,19 +102,19 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                     finally:
                         await api.close()
 
-                except EONMFARequiredError as err:
+                except EonEnergiaMfaRequiredError as err:
                     _LOGGER.info("MFA required for authentication")
                     self._mfa_session_data = err.session_data
                     # Store credentials for after MFA completion
                     self._username = username
                     self._password = password
                     return await self.async_step_mfa()
-                except EONAuthError as err:
+                except EonEnergiaAuthError as err:
                     _LOGGER.error("Authentication failed: %s", err)
                     errors["base"] = "invalid_auth"
                     # Offer fallback for manual auth
                     return await self.async_step_auth_fallback()
-                except EONEnergiaApiError as err:
+                except EonEnergiaApiError as err:
                     _LOGGER.error("API error: %s", err)
                     errors["base"] = "cannot_connect"
                 except Exception as err:
@@ -144,7 +147,7 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "invalid_mfa_code"
             else:
                 try:
-                    tokens = await EONAuth0Client.submit_mfa_code(
+                    tokens = await EonEnergiaAuth.submit_mfa_code(
                         mfa_code, self._mfa_session_data
                     )
 
@@ -152,7 +155,7 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                     self._refresh_token = tokens.get("refresh_token")
 
                     # Now fetch PODs
-                    api = EONEnergiaApi(
+                    api = EonEnergiaClient(
                         access_token=self._access_token,
                         refresh_token=self._refresh_token,
                     )
@@ -169,10 +172,10 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                     finally:
                         await api.close()
 
-                except EONAuthError as err:
+                except EonEnergiaAuthError as err:
                     _LOGGER.error("MFA authentication failed: %s", err)
                     errors["base"] = "invalid_mfa_code"
-                except EONEnergiaApiError as err:
+                except EonEnergiaApiError as err:
                     _LOGGER.error("API error: %s", err)
                     errors["base"] = "cannot_connect"
                 except Exception as err:
@@ -208,13 +211,13 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                     errors["base"] = "invalid_callback_url"
                 else:
                     try:
-                        tokens = await EONAuth0Client.exchange_code_for_tokens(code)
+                        tokens = await EonEnergiaAuth.exchange_code_for_tokens(code)
 
                         self._access_token = tokens["access_token"]
                         self._refresh_token = tokens.get("refresh_token")
 
                         # Now fetch PODs
-                        api = EONEnergiaApi(
+                        api = EonEnergiaClient(
                             access_token=self._access_token,
                             refresh_token=self._refresh_token,
                         )
@@ -231,10 +234,10 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                         finally:
                             await api.close()
 
-                    except EONAuthError as err:
+                    except EonEnergiaAuthError as err:
                         _LOGGER.error("Token exchange failed: %s", err)
                         errors["base"] = "invalid_callback_url"
-                    except EONEnergiaApiError as err:
+                    except EonEnergiaApiError as err:
                         _LOGGER.error("API error: %s", err)
                         errors["base"] = "cannot_connect"
                     except Exception as err:
@@ -321,32 +324,18 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
         )
 
-    def _extract_pod_code(self, pod: dict[str, Any]) -> str:
-        """Extract POD code from API response."""
-        for field in ["PODID", "podid", "PR", "pr", "POD", "pod", "code", "Code", "pointOfDelivery"]:
-            if field in pod:
-                return str(pod[field])
-        for value in pod.values():
-            if isinstance(value, str) and len(value) > 5:
-                return value
-        return str(pod)
+    def _extract_pod_code(self, pod: PointOfDelivery) -> str:
+        """Return the code this integration keys everything on.
 
-    def _format_pod_label(self, pod: dict[str, Any]) -> str:
-        """Format POD for display in selection list."""
+        The library already picks PODID over PRID; the guesswork that used to live
+        here existed only because the response was an untyped dict.
+        """
+        return pod.pod_id or ""
+
+    def _format_pod_label(self, pod: PointOfDelivery) -> str:
+        """Format one metering point for the selection list."""
         code = self._extract_pod_code(pod)
-
-        delivery_address = pod.get("DeliveryAddress", {})
-        if delivery_address:
-            street = delivery_address.get("Street", "")
-            number = delivery_address.get("Number", "")
-            city = delivery_address.get("City", "")
-            if street and city:
-                return f"{code} - {street} {number}, {city}"
-
-        address = pod.get("address", pod.get("Address", ""))
-        if address:
-            return f"{code} - {address}"
-        return code
+        return f"{code} - {pod.address}" if pod.address else code
 
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
@@ -379,13 +368,13 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "invalid_auth"
             else:
                 try:
-                    tokens = await EONAuth0Client.login(username, password)
+                    tokens = await EonEnergiaAuth.login(username, password)
 
                     access_token = tokens["access_token"]
                     refresh_token = tokens.get("refresh_token")
 
                     # Verify the POD is still accessible
-                    api = EONEnergiaApi(
+                    api = EonEnergiaClient(
                         access_token=access_token,
                         refresh_token=refresh_token,
                     )
@@ -412,20 +401,20 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                     finally:
                         await api.close()
 
-                except EONMFARequiredError as err:
+                except EonEnergiaMfaRequiredError as err:
                     _LOGGER.info("MFA required for reconfiguration")
                     self._mfa_session_data = err.session_data
                     self._tariff_type = tariff_type
                     self._username = username
                     self._password = password
                     return await self.async_step_reconfigure_mfa()
-                except EONAuthError as err:
+                except EonEnergiaAuthError as err:
                     _LOGGER.error("Authentication failed: %s", err)
                     errors["base"] = "invalid_auth"
                     # Offer fallback for manual auth
                     self._tariff_type = tariff_type
                     return await self.async_step_reconfigure_fallback()
-                except EONEnergiaApiError as err:
+                except EonEnergiaApiError as err:
                     _LOGGER.error("API error: %s", err)
                     errors["base"] = "cannot_connect"
                 except Exception as err:
@@ -472,7 +461,7 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "invalid_mfa_code"
             else:
                 try:
-                    tokens = await EONAuth0Client.submit_mfa_code(
+                    tokens = await EonEnergiaAuth.submit_mfa_code(
                         mfa_code, self._mfa_session_data
                     )
 
@@ -480,7 +469,7 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                     refresh_token = tokens.get("refresh_token")
 
                     # Verify the POD is still accessible
-                    api = EONEnergiaApi(
+                    api = EonEnergiaClient(
                         access_token=access_token,
                         refresh_token=refresh_token,
                     )
@@ -507,10 +496,10 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                     finally:
                         await api.close()
 
-                except EONAuthError as err:
+                except EonEnergiaAuthError as err:
                     _LOGGER.error("MFA authentication failed: %s", err)
                     errors["base"] = "invalid_mfa_code"
-                except EONEnergiaApiError as err:
+                except EonEnergiaApiError as err:
                     _LOGGER.error("API error: %s", err)
                     errors["base"] = "cannot_connect"
                 except Exception as err:
@@ -548,13 +537,13 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                     errors["base"] = "invalid_callback_url"
                 else:
                     try:
-                        tokens = await EONAuth0Client.exchange_code_for_tokens(code)
+                        tokens = await EonEnergiaAuth.exchange_code_for_tokens(code)
 
                         access_token = tokens["access_token"]
                         refresh_token = tokens.get("refresh_token")
 
                         # Verify the POD is still accessible
-                        api = EONEnergiaApi(
+                        api = EonEnergiaClient(
                             access_token=access_token,
                             refresh_token=refresh_token,
                         )
@@ -584,10 +573,10 @@ class EONEnergiaConfigFlow(ConfigFlow, domain=DOMAIN):
                         finally:
                             await api.close()
 
-                    except EONAuthError as err:
+                    except EonEnergiaAuthError as err:
                         _LOGGER.error("Token exchange failed: %s", err)
                         errors["base"] = "invalid_callback_url"
-                    except EONEnergiaApiError as err:
+                    except EonEnergiaApiError as err:
                         _LOGGER.error("API error: %s", err)
                         errors["base"] = "cannot_connect"
                     except Exception as err:
@@ -653,13 +642,13 @@ class EONEnergiaOptionsFlow(OptionsFlow):
                 errors["base"] = "invalid_auth"
             else:
                 try:
-                    tokens = await EONAuth0Client.login(username, password)
+                    tokens = await EonEnergiaAuth.login(username, password)
 
                     access_token = tokens["access_token"]
                     refresh_token = tokens.get("refresh_token")
 
                     # Verify the POD is still accessible
-                    api = EONEnergiaApi(
+                    api = EonEnergiaClient(
                         access_token=access_token,
                         refresh_token=refresh_token,
                     )
@@ -688,20 +677,20 @@ class EONEnergiaOptionsFlow(OptionsFlow):
                     finally:
                         await api.close()
 
-                except EONMFARequiredError as err:
+                except EonEnergiaMfaRequiredError as err:
                     _LOGGER.info("MFA required for options re-authentication")
                     self._mfa_session_data = err.session_data
                     self._tariff_type = tariff_type
                     self._username = username
                     self._password = password
                     return await self.async_step_mfa()
-                except EONAuthError as err:
+                except EonEnergiaAuthError as err:
                     _LOGGER.error("Authentication failed: %s", err)
                     errors["base"] = "invalid_auth"
                     # Offer fallback for manual auth
                     self._tariff_type = tariff_type
                     return await self.async_step_auth_fallback()
-                except EONEnergiaApiError as err:
+                except EonEnergiaApiError as err:
                     _LOGGER.error("API error: %s", err)
                     errors["base"] = "cannot_connect"
                 except Exception as err:
@@ -748,7 +737,7 @@ class EONEnergiaOptionsFlow(OptionsFlow):
                 errors["base"] = "invalid_mfa_code"
             else:
                 try:
-                    tokens = await EONAuth0Client.submit_mfa_code(
+                    tokens = await EonEnergiaAuth.submit_mfa_code(
                         mfa_code, self._mfa_session_data
                     )
 
@@ -756,7 +745,7 @@ class EONEnergiaOptionsFlow(OptionsFlow):
                     refresh_token = tokens.get("refresh_token")
 
                     # Verify the POD is still accessible
-                    api = EONEnergiaApi(
+                    api = EonEnergiaClient(
                         access_token=access_token,
                         refresh_token=refresh_token,
                     )
@@ -785,10 +774,10 @@ class EONEnergiaOptionsFlow(OptionsFlow):
                     finally:
                         await api.close()
 
-                except EONAuthError as err:
+                except EonEnergiaAuthError as err:
                     _LOGGER.error("MFA authentication failed: %s", err)
                     errors["base"] = "invalid_mfa_code"
-                except EONEnergiaApiError as err:
+                except EonEnergiaApiError as err:
                     _LOGGER.error("API error: %s", err)
                     errors["base"] = "cannot_connect"
                 except Exception as err:
@@ -826,13 +815,13 @@ class EONEnergiaOptionsFlow(OptionsFlow):
                     errors["base"] = "invalid_callback_url"
                 else:
                     try:
-                        tokens = await EONAuth0Client.exchange_code_for_tokens(code)
+                        tokens = await EonEnergiaAuth.exchange_code_for_tokens(code)
 
                         access_token = tokens["access_token"]
                         refresh_token = tokens.get("refresh_token")
 
                         # Verify the POD is still accessible
-                        api = EONEnergiaApi(
+                        api = EonEnergiaClient(
                             access_token=access_token,
                             refresh_token=refresh_token,
                         )
@@ -859,10 +848,10 @@ class EONEnergiaOptionsFlow(OptionsFlow):
                         finally:
                             await api.close()
 
-                    except EONAuthError as err:
+                    except EonEnergiaAuthError as err:
                         _LOGGER.error("Token exchange failed: %s", err)
                         errors["base"] = "invalid_callback_url"
-                    except EONEnergiaApiError as err:
+                    except EonEnergiaApiError as err:
                         _LOGGER.error("API error: %s", err)
                         errors["base"] = "cannot_connect"
                     except Exception as err:
@@ -886,22 +875,6 @@ class EONEnergiaOptionsFlow(OptionsFlow):
             },
         )
 
-    def _extract_pod_code(self, pod: dict[str, Any]) -> str:
-        """Extract POD code from API response."""
-        for field in [
-            "PODID",
-            "podid",
-            "PR",
-            "pr",
-            "POD",
-            "pod",
-            "code",
-            "Code",
-            "pointOfDelivery",
-        ]:
-            if field in pod:
-                return str(pod[field])
-        for value in pod.values():
-            if isinstance(value, str) and len(value) > 5:
-                return value
-        return str(pod)
+    def _extract_pod_code(self, pod: PointOfDelivery) -> str:
+        """Return the code this integration keys everything on."""
+        return pod.pod_id or ""

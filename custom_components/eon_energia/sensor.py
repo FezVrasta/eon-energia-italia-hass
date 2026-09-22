@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -22,9 +22,8 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
 )
 
-from .api import EONEnergiaApi
+from pyeonenergia import EonEnergiaClient, HourlyConsumption, fascia_for_hour
 from .const import DOMAIN, CONF_TARIFF_TYPE, TARIFF_MULTIORARIA
-from . import _is_italian_holiday
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -103,15 +102,7 @@ class EONEnergiaBaseSensor(CoordinatorEntity, SensorEntity):
         else:
             day_data = data
 
-        hourly_values = []
-        for hour in range(1, 25):
-            key = f"valore_h{hour:02d}"
-            if key in day_data:
-                try:
-                    value = float(day_data[key])
-                    hourly_values.append((hour, value))
-                except (ValueError, TypeError):
-                    continue
+        hourly_values = sorted(day_data.values.items())
 
         return hourly_values
 
@@ -159,16 +150,17 @@ class EONEnergiaDailyConsumptionSensor(EONEnergiaBaseSensor):
                 day_data = data
 
             # Add metadata from the response
-            if "data" in day_data:
-                attrs["data_date"] = day_data["data"]
-            if "pod" in day_data:
-                attrs["pod_code"] = day_data["pod"]
-            if "codice_cliente" in day_data:
-                attrs["customer_code"] = day_data["codice_cliente"]
-            if "sorgente" in day_data:
-                attrs["data_source"] = day_data["sorgente"]
-            if "trattamento" in day_data:
-                attrs["treatment"] = day_data["trattamento"]
+            if day_data.day:
+                attrs["data_date"] = day_data.day.isoformat()
+            if day_data.pod:
+                attrs["pod_code"] = day_data.pod
+            if day_data.account_id:
+                attrs["customer_code"] = day_data.account_id
+            if day_data.source:
+                attrs["data_source"] = day_data.source
+            # Not modelled: only E.ON know what "trattamento" means.
+            if treatment := day_data.raw.get("trattamento"):
+                attrs["treatment"] = treatment
 
             # Add hourly breakdown
             hourly_values = self._get_hourly_values()
@@ -228,8 +220,8 @@ class EONEnergiaLastReadingSensor(EONEnergiaBaseSensor):
                 else:
                     day_data = data
 
-                if "data" in day_data:
-                    attrs["reading_date"] = day_data["data"]
+                if day_data.day:
+                    attrs["reading_date"] = day_data.day.isoformat()
 
         return attrs
 
@@ -252,7 +244,7 @@ class EONEnergiaTokenStatusSensor(SensorEntity):
         coordinator: DataUpdateCoordinator,
         entry: ConfigEntry,
         pod: str,
-        api: EONEnergiaApi,
+        api: EonEnergiaClient,
     ) -> None:
         """Initialize the sensor."""
         self.coordinator = coordinator
@@ -325,7 +317,7 @@ class EONEnergiaCumulativeEnergySensor(RestoreEntity, SensorEntity):
         coordinator: DataUpdateCoordinator,
         entry: ConfigEntry,
         pod: str,
-        api: EONEnergiaApi,
+        api: EonEnergiaClient,
         fascia: str | None = None,
     ) -> None:
         """Initialize the cumulative energy sensor.
@@ -421,7 +413,7 @@ class EONEnergiaCumulativeEnergySensor(RestoreEntity, SensorEntity):
             day_data = data
 
         # Get the date from the data
-        data_date = day_data.get("data")
+        data_date = day_data.day.isoformat() if day_data.day else None
         if not data_date:
             return
 
@@ -449,43 +441,16 @@ class EONEnergiaCumulativeEnergySensor(RestoreEntity, SensorEntity):
                 self._cumulative_total,
             )
 
-    def _calculate_day_total(self, day_data: dict[str, Any], date: datetime) -> float:
-        """Calculate the total consumption for a day, optionally filtered by fascia."""
+    def _calculate_day_total(self, day_data: HourlyConsumption, date: datetime) -> float:
+        """Total consumption for a day, optionally filtered by tariff band."""
         total = 0.0
-        for hour in range(1, 25):
-            key = f"valore_h{hour:02d}"
-            if key in day_data:
-                try:
-                    value = float(day_data[key])
-                    if value > 0:
-                        # If tracking a specific fascia, check if this hour belongs to it
-                        if self._fascia:
-                            hour_fascia = self._get_fascia_for_hour(date, hour)
-                            if hour_fascia == self._fascia:
-                                total += value
-                        else:
-                            total += value
-                except (ValueError, TypeError):
-                    continue
+        for hour, value in sorted(day_data.values.items()):
+            if value <= 0:
+                continue
+            if self._fascia and fascia_for_hour(date, hour) != self._fascia:
+                continue
+            total += value
         return round(total, 3)
-
-    @staticmethod
-    def _get_fascia_for_hour(dt: datetime, hour: int) -> str:
-        """Determine the tariff band (fascia) for a given datetime and hour."""
-        hour_0_based = hour - 1
-        weekday = dt.weekday()
-
-        # Sundays and Italian national holidays are always F3
-        if weekday == 6 or _is_italian_holiday(dt):
-            return "F3"
-        if weekday == 5:  # Saturday
-            return "F2" if 7 <= hour_0_based < 23 else "F3"
-        # Monday to Friday
-        if 8 <= hour_0_based < 19:
-            return "F1"
-        elif hour_0_based == 7 or 19 <= hour_0_based < 23:
-            return "F2"
-        return "F3"
 
     @property
     def native_value(self) -> float:
@@ -551,7 +516,7 @@ class EONEnergiaLatestInvoiceSensor(CoordinatorEntity, SensorEntity):
         # Sort by issue date (DataEmissione) to get the latest
         sorted_invoices = sorted(
             invoices,
-            key=lambda x: datetime.strptime(x.get("DataEmissione", "01/01/1970"), "%d/%m/%Y"),
+            key=lambda invoice: invoice.issued_on or date.min,
             reverse=True,
         )
         return sorted_invoices[0] if sorted_invoices else None
@@ -564,7 +529,7 @@ class EONEnergiaLatestInvoiceSensor(CoordinatorEntity, SensorEntity):
             return None
 
         try:
-            return float(invoice.get("Importo", 0))
+            return float(invoice.amount or 0)
         except (ValueError, TypeError):
             return None
 
@@ -577,15 +542,15 @@ class EONEnergiaLatestInvoiceSensor(CoordinatorEntity, SensorEntity):
 
         invoice = self._get_latest_invoice()
         if invoice:
-            attrs["invoice_number"] = invoice.get("Numero") or invoice.get("NumeroDocumento")
-            attrs["issue_date"] = invoice.get("DataEmissione")
-            attrs["due_date"] = invoice.get("DataScadenza")
-            attrs["payment_status"] = invoice.get("StatoPagamento")
-            attrs["amount_paid"] = invoice.get("ImportoPagato")
-            attrs["amount_remaining"] = invoice.get("ImportoResiduo")
+            attrs["invoice_number"] = invoice.number or invoice.raw.get("NumeroDocumento")
+            attrs["issue_date"] = invoice.issued_on.isoformat() if invoice.issued_on else None
+            attrs["due_date"] = invoice.due_on.isoformat() if invoice.due_on else None
+            attrs["payment_status"] = invoice.payment_status
+            attrs["amount_paid"] = invoice.paid
+            attrs["amount_remaining"] = invoice.outstanding
 
             # Get period and amount from ListaForniture if available
-            forniture = invoice.get("ListaForniture", [])
+            forniture = invoice.raw.get("ListaForniture", [])
             for fornitura in forniture:
                 codice_fornitura = fornitura.get("CodiceFornitura", "")
                 codice_pdr_pod = fornitura.get("CodicePDR_POD", "")
@@ -634,7 +599,7 @@ class EONEnergiaInvoicePaymentStatusSensor(CoordinatorEntity, SensorEntity):
 
         sorted_invoices = sorted(
             invoices,
-            key=lambda x: datetime.strptime(x.get("DataEmissione", "01/01/1970"), "%d/%m/%Y"),
+            key=lambda invoice: invoice.issued_on or date.min,
             reverse=True,
         )
         return sorted_invoices[0] if sorted_invoices else None
@@ -646,7 +611,7 @@ class EONEnergiaInvoicePaymentStatusSensor(CoordinatorEntity, SensorEntity):
         if not invoice:
             return None
 
-        status = invoice.get("StatoPagamento", "")
+        status = invoice.payment_status or ""
         # Translate common statuses
         status_map = {
             "PAID": "paid",
@@ -667,12 +632,12 @@ class EONEnergiaInvoicePaymentStatusSensor(CoordinatorEntity, SensorEntity):
 
         invoice = self._get_latest_invoice()
         if invoice:
-            attrs["invoice_number"] = invoice.get("Numero") or invoice.get("NumeroDocumento")
-            attrs["due_date"] = invoice.get("DataScadenza")
-            attrs["total_amount"] = invoice.get("Importo")
-            attrs["amount_paid"] = invoice.get("ImportoPagato")
-            attrs["amount_remaining"] = invoice.get("ImportoResiduo")
-            attrs["raw_status"] = invoice.get("StatoPagamento")
+            attrs["invoice_number"] = invoice.number or invoice.raw.get("NumeroDocumento")
+            attrs["due_date"] = invoice.due_on.isoformat() if invoice.due_on else None
+            attrs["total_amount"] = invoice.amount
+            attrs["amount_paid"] = invoice.paid
+            attrs["amount_remaining"] = invoice.outstanding
+            attrs["raw_status"] = invoice.payment_status
 
         return attrs
 
@@ -713,7 +678,7 @@ class EONEnergiaUnpaidInvoicesSensor(CoordinatorEntity, SensorEntity):
         total_unpaid = 0.0
         for invoice in self.coordinator.data:
             try:
-                remaining = float(invoice.get("ImportoResiduo", 0))
+                remaining = float(invoice.outstanding or 0)
                 if remaining > 0:
                     total_unpaid += remaining
             except (ValueError, TypeError):
@@ -732,11 +697,11 @@ class EONEnergiaUnpaidInvoicesSensor(CoordinatorEntity, SensorEntity):
             unpaid_invoices = []
             for invoice in self.coordinator.data:
                 try:
-                    remaining = float(invoice.get("ImportoResiduo", 0))
+                    remaining = float(invoice.outstanding or 0)
                     if remaining > 0:
                         unpaid_invoices.append({
-                            "number": invoice.get("Numero") or invoice.get("NumeroDocumento"),
-                            "due_date": invoice.get("DataScadenza"),
+                            "number": invoice.number or invoice.raw.get("NumeroDocumento"),
+                            "due_date": invoice.due_on.isoformat() if invoice.due_on else None,
                             "amount": remaining,
                         })
                 except (ValueError, TypeError):
@@ -829,14 +794,14 @@ class EONEnergiaTotalInvoicedSensor(RestoreEntity, SensorEntity):
             return
 
         for invoice in self.coordinator.data:
-            invoice_number = invoice.get("Numero") or invoice.get("NumeroDocumento")
+            invoice_number = invoice.number or invoice.raw.get("NumeroDocumento")
             if not invoice_number or invoice_number in self._processed_invoices:
                 continue
 
             # Get the amount for this POD from the invoice
             # Check both CodiceFornitura and CodicePDR_POD since either might match
             amount = 0.0
-            forniture = invoice.get("ListaForniture", [])
+            forniture = invoice.raw.get("ListaForniture", [])
             for fornitura in forniture:
                 codice_fornitura = fornitura.get("CodiceFornitura", "")
                 codice_pdr_pod = fornitura.get("CodicePDR_POD", "")

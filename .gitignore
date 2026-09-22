@@ -64,3 +64,5 @@ config/
 secrets.yaml
 
 test_api.py
+# Library build output
+pyeonenergia/dist/

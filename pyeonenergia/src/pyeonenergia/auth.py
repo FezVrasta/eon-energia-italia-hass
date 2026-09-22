@@ -1,4 +1,7 @@
-"""Auth0 authentication module for EON Energia."""
+"""Auth0 login flow for E.ON Energia.
+
+E.ON's Auth0 client forbids password grants, so signing in means walking the
+Universal Login pages the way a browser would."""
 
 from __future__ import annotations
 
@@ -9,7 +12,18 @@ from typing import Any
 
 import aiohttp
 
-from .api_config import get_api_config
+from .config import get_api_config
+from .const import (
+    AUTH_CLIENT_ID,
+    AUTH_DOMAIN,
+    AUTH_REDIRECT_URI,
+    AUTH_SCOPE,
+)
+from .exceptions import (
+    EonEnergiaAuthError,
+    EonEnergiaCaptchaError,
+    EonEnergiaMfaRequiredError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,11 +54,6 @@ def _extract_form_action(html: str, default_url: str) -> str:
     return default_url
 
 
-# Auth0 Configuration
-AUTH_DOMAIN = "https://auth.eon-energia.com"
-AUTH_CLIENT_ID = "vEZ41cyr2pOHux9EKoN8dDgGb7UZc7EB"  # iOS app client_id
-AUTH_REDIRECT_URI = "com.eon-energia.eon.auth0://auth.eon-energia.com/ios/com.eon-energia.eon/callback"
-AUTH_SCOPE = "openid profile email offline_access"
 
 
 async def build_authorization_url() -> str:
@@ -116,21 +125,7 @@ def _has_captcha(html: str) -> bool:
     return bool(re.search(r"turnstile|recaptcha|hcaptcha", html, re.I))
 
 
-class EONAuthError(Exception):
-    """Exception for EON authentication errors."""
-
-    pass
-
-
-class EONMFARequiredError(EONAuthError):
-    """Exception raised when MFA code is required."""
-
-    def __init__(self, message: str, session_data: dict[str, Any]):
-        super().__init__(message)
-        self.session_data = session_data
-
-
-class EONAuth0Client:
+class EonEnergiaAuth:
     """Auth0 client for EON Energia authentication."""
 
     @staticmethod
@@ -146,7 +141,7 @@ class EONAuth0Client:
             dict with access_token, refresh_token, etc.
 
         Raises:
-            EONAuthError: If authentication fails
+            EonEnergiaAuthError: If authentication fails
         """
         headers = {
             "User-Agent": (
@@ -193,7 +188,7 @@ class EONAuth0Client:
 
                 if not auth_state:
                     _LOGGER.error("No state returned from /authorize, URL: %s", resp.url)
-                    raise EONAuthError("No state returned from authorization endpoint")
+                    raise EonEnergiaAuthError("No state returned from authorization endpoint")
 
             # EON uses identifier-first login flow (two steps)
             # Step 2a: POST username to /u/login/identifier
@@ -249,12 +244,12 @@ class EONAuth0Client:
                     # Auth0 Attack Protection has decided this client looks like
                     # a bot. A headless login cannot solve the challenge; the
                     # config flow's manual OAuth step is the way through.
-                    raise EONAuthError(CAPTCHA_MESSAGE)
+                    raise EonEnergiaCaptchaError(CAPTCHA_MESSAGE)
 
                 # Check for error messages in the page
                 if "user not found" in password_page_html.lower() or "no account" in password_page_html.lower():
-                    raise EONAuthError("User not found")
-                raise EONAuthError("Invalid username or authentication flow error")
+                    raise EonEnergiaAuthError("User not found")
+                raise EonEnergiaAuthError("Invalid username or authentication flow error")
 
             # Step 2b: POST password to /u/login/password
             password_hidden_fields = _extract_hidden_fields(password_page_html)
@@ -267,7 +262,7 @@ class EONAuth0Client:
                     "Password page carries a CAPTCHA challenge; not submitting "
                     "credentials into a form that cannot succeed"
                 )
-                raise EONAuthError(CAPTCHA_MESSAGE)
+                raise EonEnergiaCaptchaError(CAPTCHA_MESSAGE)
 
             password_url = f"{AUTH_DOMAIN}/u/login/password?state={auth_state}"
             password_data = {
@@ -299,12 +294,12 @@ class EONAuth0Client:
                         "Password page returned a CAPTCHA challenge instead of a "
                         "redirect; the credentials were most likely never checked"
                     )
-                    raise EONAuthError(CAPTCHA_MESSAGE)
-                raise EONAuthError("Invalid username or password")
+                    raise EonEnergiaCaptchaError(CAPTCHA_MESSAGE)
+                raise EonEnergiaAuthError("Invalid username or password")
 
             if "/u/login" in redirect_url:
                 _LOGGER.error("Login failed - redirected back to login page: %s", redirect_url)
-                raise EONAuthError("Invalid username or password")
+                raise EonEnergiaAuthError("Invalid username or password")
 
             # Step 3: Extract authorization code
             # Follow redirect chain until we get the code or hit the callback URI
@@ -412,7 +407,7 @@ class EONAuth0Client:
                             # Export cookies for session continuation
                             cookies_dict = {c.key: c.value for c in jar}
 
-                            raise EONMFARequiredError(
+                            raise EonEnergiaMfaRequiredError(
                                 "MFA SMS code required",
                                 {
                                     "mfa_url": form_action,
@@ -443,7 +438,7 @@ class EONAuth0Client:
 
             if not code:
                 _LOGGER.error("Failed to extract authorization code from redirect: %s", redirect_url)
-                raise EONAuthError(f"Auth0 login failed: {redirect_url}")
+                raise EonEnergiaAuthError(f"Auth0 login failed: {redirect_url}")
 
             # Step 4: Exchange code for tokens
             _LOGGER.debug("Exchanging authorization code for tokens")
@@ -464,13 +459,13 @@ class EONAuth0Client:
                 if resp.status != 200:
                     text = await resp.text()
                     _LOGGER.error("Token exchange failed: %s - %s", resp.status, text[:500])
-                    raise EONAuthError(f"Token exchange failed: {text[:200]}")
+                    raise EonEnergiaAuthError(f"Token exchange failed: {text[:200]}")
 
                 token_data = await resp.json()
 
             if "access_token" not in token_data:
                 _LOGGER.error("No access token in response: %s", token_data)
-                raise EONAuthError("Authentication failed - no access token received")
+                raise EonEnergiaAuthError("Authentication failed - no access token received")
 
             _LOGGER.debug("Authentication successful")
             return token_data
@@ -487,7 +482,7 @@ class EONAuth0Client:
             dict with access_token, refresh_token, etc.
 
         Raises:
-            EONAuthError: If token exchange fails
+            EonEnergiaAuthError: If token exchange fails
         """
         _LOGGER.debug("Exchanging authorization code for tokens")
 
@@ -508,13 +503,13 @@ class EONAuth0Client:
                 if resp.status != 200:
                     text = await resp.text()
                     _LOGGER.error("Token exchange failed: %s - %s", resp.status, text[:500])
-                    raise EONAuthError(f"Token exchange failed: {text[:200]}")
+                    raise EonEnergiaAuthError(f"Token exchange failed: {text[:200]}")
 
                 token_data = await resp.json()
 
         if "access_token" not in token_data:
             _LOGGER.error("No access token in response: %s", token_data)
-            raise EONAuthError("Authentication failed - no access token received")
+            raise EonEnergiaAuthError("Authentication failed - no access token received")
 
         _LOGGER.debug("Token exchange successful")
         return token_data
@@ -526,13 +521,13 @@ class EONAuth0Client:
 
         Args:
             mfa_code: The SMS/OTP code received by the user
-            session_data: Session data from EONMFARequiredError
+            session_data: Session data from EonEnergiaMfaRequiredError
 
         Returns:
             dict with access_token, refresh_token, etc.
 
         Raises:
-            EONAuthError: If authentication fails
+            EonEnergiaAuthError: If authentication fails
         """
         mfa_url = session_data["mfa_url"]
         hidden_fields = session_data["hidden_fields"]
@@ -566,10 +561,10 @@ class EONAuth0Client:
                 _LOGGER.debug("MFA submit redirect: %s", redirect_url)
 
             if not redirect_url:
-                raise EONAuthError("MFA code submission failed - no redirect")
+                raise EonEnergiaAuthError("MFA code submission failed - no redirect")
 
             if "/u/login" in redirect_url or "mfa" in redirect_url.lower():
-                raise EONAuthError("Invalid MFA code")
+                raise EonEnergiaAuthError("Invalid MFA code")
 
             # Follow redirects to get the authorization code
             code = None
@@ -613,7 +608,7 @@ class EONAuth0Client:
                 code = urllib.parse.parse_qs(parsed.query).get("code", [None])[0]
 
             if not code:
-                raise EONAuthError(f"Failed to get authorization code after MFA: {current_redirect}")
+                raise EonEnergiaAuthError(f"Failed to get authorization code after MFA: {current_redirect}")
 
             # Exchange code for tokens
             _LOGGER.debug("Exchanging authorization code for tokens")
@@ -634,13 +629,13 @@ class EONAuth0Client:
                 if resp.status != 200:
                     text = await resp.text()
                     _LOGGER.error("Token exchange failed: %s - %s", resp.status, text[:500])
-                    raise EONAuthError(f"Token exchange failed: {text[:200]}")
+                    raise EonEnergiaAuthError(f"Token exchange failed: {text[:200]}")
 
                 token_data = await resp.json()
 
             if "access_token" not in token_data:
                 _LOGGER.error("No access token in response: %s", token_data)
-                raise EONAuthError("Authentication failed - no access token received")
+                raise EonEnergiaAuthError("Authentication failed - no access token received")
 
             _LOGGER.debug("Authentication successful after MFA")
             return token_data

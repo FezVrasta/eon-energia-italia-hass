@@ -1,4 +1,4 @@
-"""EON Energia API Client."""
+"""Async client for the E.ON Energia (Italy) customer API."""
 
 from __future__ import annotations
 
@@ -12,7 +12,12 @@ from typing import Any, Callable
 
 import aiohttp
 
-from .api_config import ApiConfigError, get_api_config
+from .config import get_api_config
+from .exceptions import (
+    EonEnergiaApiError,
+    EonEnergiaAuthError,
+)
+from .models import Account, HourlyConsumption, Invoice, PointOfDelivery
 from .const import (
     AUTH_CLIENT_ID,
     AUTH_TOKEN_URL,
@@ -52,19 +57,7 @@ def _jwt_expiry(token: str | None) -> float | None:
         return None
 
 
-class EONEnergiaApiError(Exception):
-    """Base exception for EON Energia API errors."""
-
-
-class EONEnergiaAuthError(EONEnergiaApiError):
-    """Authentication error."""
-
-
-class EONEnergiaTokenRefreshError(EONEnergiaApiError):
-    """Token refresh error."""
-
-
-class EONEnergiaApi:
+class EonEnergiaClient:
     """EON Energia API client with OAuth token refresh support."""
 
     def __init__(
@@ -110,9 +103,9 @@ class EONEnergiaApi:
             session = await self._get_session()
             try:
                 self._api_config = await get_api_config(session)
-            except ApiConfigError as err:
+            except EonEnergiaConfigError as err:
                 _LOGGER.error("Failed to get API configuration: %s", err)
-                raise EONEnergiaApiError(
+                raise EonEnergiaApiError(
                     f"Failed to get API configuration: {err}"
                 ) from err
         return self._api_config
@@ -220,9 +213,9 @@ class EONEnergiaApi:
         _LOGGER.info("Attempting re-authentication with stored credentials")
 
         try:
-            from .auth import EONAuth0Client, EONAuthError, EONMFARequiredError
+            from .auth import EonEnergiaAuth, EonEnergiaAuthError, EonEnergiaMfaRequiredError
 
-            tokens = await EONAuth0Client.login(self._username, self._password)
+            tokens = await EonEnergiaAuth.login(self._username, self._password)
 
             new_access_token = tokens.get("access_token")
             new_refresh_token = tokens.get("refresh_token")
@@ -252,10 +245,10 @@ class EONEnergiaApi:
 
             return True
 
-        except EONMFARequiredError:
+        except EonEnergiaMfaRequiredError:
             _LOGGER.error("MFA required for re-authentication - cannot proceed automatically")
             return False
-        except EONAuthError as err:
+        except EonEnergiaAuthError as err:
             _LOGGER.error("Re-authentication failed: %s", err)
             return False
         except Exception as err:
@@ -327,10 +320,10 @@ class EONEnergiaApi:
                                 method, endpoint, data, params, retry_on_auth_error=False
                             )
                     if response.status == 401:
-                        raise EONEnergiaAuthError("Invalid or expired access token")
+                        raise EonEnergiaAuthError("Invalid or expired access token")
                     # A 500 that survived a refresh is a server error, not ours.
                     text = await response.text()
-                    raise EONEnergiaApiError(
+                    raise EonEnergiaApiError(
                         f"API request failed with status {response.status}: {text[:500]}"
                     )
 
@@ -346,7 +339,7 @@ class EONEnergiaApi:
                 # document list in the body. Treat the whole 2xx range as success
                 # and let the JSON parse decide whether there is anything useful.
                 if not 200 <= response.status < 300:
-                    raise EONEnergiaApiError(
+                    raise EonEnergiaApiError(
                         f"API request failed with status {response.status}: {text[:500]}"
                     )
 
@@ -357,18 +350,20 @@ class EONEnergiaApi:
                     return json.loads(text)
                 except json.JSONDecodeError as err:
                     _LOGGER.error("Failed to parse JSON response: %s", text[:500])
-                    raise EONEnergiaApiError(f"Invalid JSON response: {err}") from err
+                    raise EonEnergiaApiError(f"Invalid JSON response: {err}") from err
 
         except aiohttp.ClientError as err:
-            raise EONEnergiaApiError(f"Connection error: {err}") from err
+            raise EonEnergiaApiError(f"Connection error: {err}") from err
 
-    async def get_accounts(self) -> list[dict[str, Any]]:
-        """Get user accounts."""
-        return await self._request("GET", ENDPOINT_ACCOUNTS)
+    async def get_accounts(self) -> list[Account]:
+        """Return the accounts this login can see."""
+        payload = await self._request("GET", ENDPOINT_ACCOUNTS)
+        return [Account.from_api(item) for item in payload or []]
 
-    async def get_points_of_delivery(self) -> list[dict[str, Any]]:
-        """Get points of delivery (PODs)."""
-        return await self._request("GET", ENDPOINT_POINT_OF_DELIVERIES)
+    async def get_points_of_delivery(self) -> list[PointOfDelivery]:
+        """Return every metering point on the account."""
+        payload = await self._request("GET", ENDPOINT_POINT_OF_DELIVERIES)
+        return [PointOfDelivery.from_api(item) for item in payload or []]
 
     async def get_daily_consumption(
         self,
@@ -377,7 +372,7 @@ class EONEnergiaApi:
         end_date: datetime,
         granularity: str = GRANULARITY_HOURLY,
         measure_type: str = MEASURE_TYPE_EA,
-    ) -> dict[str, Any]:
+    ) -> list[HourlyConsumption]:
         """
         Get energy consumption data.
 
@@ -399,13 +394,14 @@ class EONEnergiaApi:
             "Misura": measure_type,
         }
 
-        return await self._request("POST", ENDPOINT_DAILY_CONSUMPTION, data)
+        payload = await self._request("POST", ENDPOINT_DAILY_CONSUMPTION, data)
+        return [HourlyConsumption.from_api(item) for item in payload or []]
 
     async def get_today_consumption(
         self,
         pod: str,
         measure_type: str = MEASURE_TYPE_EA,
-    ) -> dict[str, Any]:
+    ) -> list[HourlyConsumption]:
         """Get today's energy consumption."""
         today = datetime.now()
         return await self.get_daily_consumption(
@@ -420,7 +416,7 @@ class EONEnergiaApi:
         self,
         pod: str,
         measure_type: str = MEASURE_TYPE_EA,
-    ) -> dict[str, Any]:
+    ) -> list[HourlyConsumption]:
         """Get yesterday's energy consumption (usually more complete data)."""
         yesterday = datetime.now() - timedelta(days=1)
         return await self.get_daily_consumption(
@@ -464,7 +460,7 @@ class EONEnergiaApi:
         self,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[Invoice]:
         """Get invoices/bills.
 
         Args:
@@ -486,14 +482,14 @@ class EONEnergiaApi:
         }
 
         response = await self._request("GET", ENDPOINT_INVOICES, params=params)
-        return response.get("ListaFatture", [])
+        return [Invoice.from_api(item) for item in response.get("ListaFatture") or []]
 
     async def get_invoices_for_pod(
         self,
         pod: str,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[Invoice]:
         """Get invoices filtered by POD.
 
         Args:
@@ -515,7 +511,7 @@ class EONEnergiaApi:
         # We check both fields to ensure we match correctly
         pod_invoices = []
         for invoice in all_invoices:
-            forniture = invoice.get("ListaForniture", [])
+            forniture = invoice.raw.get("ListaForniture", [])
             for fornitura in forniture:
                 # Check if POD matches either CodiceFornitura or CodicePDR_POD
                 codice_fornitura = fornitura.get("CodiceFornitura", "")
@@ -564,10 +560,10 @@ class EONEnergiaApi:
             # Use point-of-deliveries as it's known to work
             await self.get_points_of_delivery()
             return True
-        except EONEnergiaAuthError:
+        except EonEnergiaAuthError:
             _LOGGER.debug("Token validation failed: authentication error")
             return False
-        except EONEnergiaApiError as err:
+        except EonEnergiaApiError as err:
             _LOGGER.debug("Token validation error: %s", err)
             # Other errors might mean the token is valid but there's another issue
             return True
@@ -601,7 +597,7 @@ async def exchange_code_for_tokens(
         Dictionary containing access_token, refresh_token, etc.
 
     Raises:
-        EONEnergiaAuthError: If the token exchange fails.
+        EonEnergiaAuthError: If the token exchange fails.
     """
     async with aiohttp.ClientSession() as session:
         try:
@@ -623,9 +619,9 @@ async def exchange_code_for_tokens(
                         response.status,
                         text[:200],
                     )
-                    raise EONEnergiaAuthError(f"Token exchange failed: {text[:200]}")
+                    raise EonEnergiaAuthError(f"Token exchange failed: {text[:200]}")
 
                 return await response.json()
 
         except aiohttp.ClientError as err:
-            raise EONEnergiaAuthError(f"Token exchange connection error: {err}") from err
+            raise EonEnergiaAuthError(f"Token exchange connection error: {err}") from err
