@@ -90,7 +90,10 @@ class EONEnergiaSupplySensor(SensorEntity):
         """Bind to one supply."""
         self._pod = pod
         self._supply = supply
-        self._attr_unique_id = f"{entry.entry_id}_{pod}_{key}"
+        # Keyed on the POD, like every other entity here. Never the config entry
+        # id: it is not something the supply reports, and two entries for one POD
+        # then produce duplicate entities rather than colliding and being ignored.
+        self._attr_unique_id = f"{pod}_{key}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, pod)},
             "name": f"EON Energia {pod}",

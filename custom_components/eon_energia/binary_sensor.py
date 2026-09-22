@@ -62,7 +62,7 @@ class EONEnergiaTerminationAvailableSensor(BinarySensorEntity):
         self._api = api
         self._supply = supply
         self._message: str | None = None
-        self._attr_unique_id = f"{entry.entry_id}_{pod}_termination_available"
+        self._attr_unique_id = f"{pod}_termination_available"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, pod)},
             "name": f"EON Energia {pod}",
