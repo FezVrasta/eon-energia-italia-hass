@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -22,6 +26,30 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+#: Refresh this long before the token actually expires, to cover clock skew and the
+#: round trip. Tokens live two hours, so this costs nothing.
+TOKEN_REFRESH_MARGIN = 300
+
+
+def _jwt_expiry(token: str | None) -> float | None:
+    """Return a JWT's `exp` claim as an epoch, or None if it cannot be read.
+
+    The signature is deliberately not verified: this is only used to decide when to
+    refresh early, and the server remains the authority on whether a token is good.
+    Reading it here means expiry works on existing config entries too, which never
+    stored it.
+    """
+    if not token:
+        return None
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+        return float(exp) if exp else None
+    except (IndexError, ValueError, binascii.Error, json.JSONDecodeError):
+        return None
 
 
 class EONEnergiaApiError(Exception):
@@ -64,6 +92,7 @@ class EONEnergiaApi:
         self._password = password
         self._session: aiohttp.ClientSession | None = None
         self._api_config: dict[str, str] | None = None
+        self._token_expires_at: float | None = _jwt_expiry(access_token)
 
     @property
     def access_token(self) -> str:
@@ -149,6 +178,12 @@ class EONEnergiaApi:
                     return False
 
                 self._access_token = new_access_token
+                expires_in = data.get("expires_in")
+                self._token_expires_at = (
+                    time.time() + float(expires_in)
+                    if expires_in
+                    else _jwt_expiry(new_access_token)
+                )
                 # Auth0 uses refresh token rotation - always update with the new one
                 if new_refresh_token:
                     self._refresh_token = new_refresh_token
@@ -197,6 +232,12 @@ class EONEnergiaApi:
                 return False
 
             self._access_token = new_access_token
+            expires_in = tokens.get("expires_in")
+            self._token_expires_at = (
+                time.time() + float(expires_in)
+                if expires_in
+                else _jwt_expiry(new_access_token)
+            )
             if new_refresh_token:
                 self._refresh_token = new_refresh_token
 
@@ -233,6 +274,19 @@ class EONEnergiaApi:
         session = await self._get_session()
         config = await self._get_api_config()
         url = f"{config['base_url']}{endpoint}"
+
+        # Refresh before the call rather than waiting to be told. This API does not
+        # answer 401 for an expired token (see below), so reacting to the response is
+        # unreliable; knowing the expiry is not.
+        if (
+            retry_on_auth_error
+            and self._token_expires_at
+            and time.time() >= self._token_expires_at - TOKEN_REFRESH_MARGIN
+            and self._refresh_token
+        ):
+            _LOGGER.debug("Access token is about to expire, refreshing first")
+            await self.refresh_access_token()
+
         headers = await self._get_headers()
 
         try:
@@ -243,10 +297,21 @@ class EONEnergiaApi:
                 json=data if method == "POST" else None,
                 params=params,
             ) as response:
-                if response.status == 401:
-                    # Token expired - try to refresh
+                # 401 is the documented answer for a bad token. This API does not
+                # use it: an expired token, a garbage one and no Authorization header
+                # at all all come back as HTTP 500 with a generic "Internal server
+                # error" body. So 500 has to be treated as possibly-auth too, or a
+                # token expiring quietly breaks every poll until Home Assistant is
+                # restarted, which is exactly what used to happen two hours after
+                # setup. The retry_on_auth_error flag bounds this to one extra
+                # attempt, so a genuine server error costs one wasted refresh.
+                if response.status in (401, 500):
                     if retry_on_auth_error:
-                        _LOGGER.info("Access token expired, attempting refresh")
+                        _LOGGER.info(
+                            "HTTP %s from %s, refreshing the token and retrying once",
+                            response.status,
+                            endpoint,
+                        )
                         refreshed = False
                         if self._refresh_token:
                             refreshed = await self.refresh_access_token()
@@ -261,7 +326,13 @@ class EONEnergiaApi:
                             return await self._request(
                                 method, endpoint, data, params, retry_on_auth_error=False
                             )
-                    raise EONEnergiaAuthError("Invalid or expired access token")
+                    if response.status == 401:
+                        raise EONEnergiaAuthError("Invalid or expired access token")
+                    # A 500 that survived a refresh is a server error, not ours.
+                    text = await response.text()
+                    raise EONEnergiaApiError(
+                        f"API request failed with status {response.status}: {text[:500]}"
+                    )
 
                 # Get response text first for debugging
                 text = await response.text()
@@ -271,7 +342,10 @@ class EONEnergiaApi:
                     response.content_type,
                 )
 
-                if response.status != 200:
+                # Not just 200: the invoices endpoint answers 202 with the full
+                # document list in the body. Treat the whole 2xx range as success
+                # and let the JSON parse decide whether there is anything useful.
+                if not 200 <= response.status < 300:
                     raise EONEnergiaApiError(
                         f"API request failed with status {response.status}: {text[:500]}"
                     )
