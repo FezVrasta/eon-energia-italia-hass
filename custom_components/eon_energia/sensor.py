@@ -22,8 +22,18 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
 )
 
-from pyeonenergia import EonEnergiaClient, HourlyConsumption, fascia_for_hour
-from .const import DOMAIN, CONF_TARIFF_TYPE, TARIFF_MULTIORARIA
+from pyeonenergia import (
+    EonEnergiaClient,
+    HourlyConsumption,
+    PointOfDelivery,
+    fascia_for_hour,
+)
+from .const import DOMAIN, TARIFF_MULTIORARIA
+from .entity import (
+    EonEnergiaSupplyEntity,
+    build_device_info,
+    unique_id,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -34,12 +44,13 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up EON Energia sensors from a config entry."""
-    data = hass.data[DOMAIN][entry.entry_id]
-    coordinator = data["coordinator"]
-    invoice_coordinator = data["invoice_coordinator"]
-    pod = data["pod"]
-    api = data["api"]
-    tariff_type = data.get("tariff_type", TARIFF_MULTIORARIA)
+    data = entry.runtime_data
+    coordinator = data.coordinator
+    invoice_coordinator = data.invoice_coordinator
+    pod = data.pod
+    api = data.api
+    tariff_type = data.tariff_type
+    supply = data.supply
 
     entities = [
         # Consumption sensors
@@ -57,11 +68,11 @@ async def async_setup_entry(
     # Contract facts, from the supply detail fetched at setup. Absent if that
     # call failed, in which case the entities are simply not created rather than
     # created permanently unknown.
-    if supply := data.get("supply"):
+    if supply:
         entities.extend(
             [
-                EONEnergiaContractedPowerSensor(entry, pod, supply),
-                EONEnergiaOfferEndSensor(entry, pod, supply),
+                EONEnergiaContractedPowerSensor(pod, supply),
+                EONEnergiaOfferEndSensor(pod, supply),
             ]
         )
 
@@ -76,42 +87,18 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class EONEnergiaSupplySensor(SensorEntity):
-    """Base for entities describing the contract rather than the consumption.
-
-    These do not use a coordinator: the underlying values change when the
-    contract does, which is roughly annually, so they are read once at setup.
-    """
-
-    _attr_has_entity_name = True
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-
-    def __init__(self, entry: ConfigEntry, pod: str, supply, key: str) -> None:
-        """Bind to one supply."""
-        self._pod = pod
-        self._supply = supply
-        # Keyed on the POD, like every other entity here. Never the config entry
-        # id: it is not something the supply reports, and two entries for one POD
-        # then produce duplicate entities rather than colliding and being ignored.
-        self._attr_unique_id = f"{pod}_{key}"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, pod)},
-            "name": f"EON Energia {pod}",
-            "manufacturer": "EON Energia",
-            "model": supply.product_name or "Smart Meter",
-        }
-
-
-class EONEnergiaContractedPowerSensor(EONEnergiaSupplySensor):
+class EONEnergiaContractedPowerSensor(EonEnergiaSupplyEntity, SensorEntity):
     """The power the contract is sold at."""
 
     _attr_translation_key = "contracted_power"
     _attr_device_class = SensorDeviceClass.POWER
     _attr_native_unit_of_measurement = UnitOfPower.KILO_WATT
 
-    def __init__(self, entry: ConfigEntry, pod: str, supply) -> None:
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, pod: str, supply: PointOfDelivery) -> None:
         """Initialise."""
-        super().__init__(entry, pod, supply, "contracted_power")
+        self._init_supply(pod, "contracted_power", supply)
 
     @property
     def native_value(self) -> float | None:
@@ -141,7 +128,7 @@ class EONEnergiaContractedPowerSensor(EONEnergiaSupplySensor):
         }
 
 
-class EONEnergiaOfferEndSensor(EONEnergiaSupplySensor):
+class EONEnergiaOfferEndSensor(EonEnergiaSupplyEntity, SensorEntity):
     """When the current offer expires.
 
     Worth surfacing: Italian retail offers are fixed-term, and the tariff after
@@ -151,9 +138,11 @@ class EONEnergiaOfferEndSensor(EONEnergiaSupplySensor):
     _attr_translation_key = "offer_end"
     _attr_device_class = SensorDeviceClass.DATE
 
-    def __init__(self, entry: ConfigEntry, pod: str, supply) -> None:
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, pod: str, supply: PointOfDelivery) -> None:
         """Initialise."""
-        super().__init__(entry, pod, supply, "offer_end")
+        self._init_supply(pod, "offer_end", supply)
 
     @property
     def native_value(self) -> date | None:
@@ -188,12 +177,7 @@ class EONEnergiaBaseSensor(CoordinatorEntity, SensorEntity):
         super().__init__(coordinator)
         self._pod = pod
         self._entry = entry
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, pod)},
-            "name": f"EON Energia {pod}",
-            "manufacturer": "EON Energia",
-            "model": "Smart Meter",
-        }
+        self._attr_device_info = build_device_info(pod)
 
     def _get_hourly_values(self) -> list[tuple[int, float]]:
         """Extract hourly values from API response.
@@ -231,7 +215,7 @@ class EONEnergiaDailyConsumptionSensor(EONEnergiaBaseSensor):
     ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator, entry, pod)
-        self._attr_unique_id = f"{pod}_daily_consumption"
+        self._attr_unique_id = unique_id(pod, "daily_consumption")
 
     @property
     def native_value(self) -> float | None:
@@ -296,7 +280,7 @@ class EONEnergiaLastReadingSensor(EONEnergiaBaseSensor):
     ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator, entry, pod)
-        self._attr_unique_id = f"{pod}_last_reading"
+        self._attr_unique_id = unique_id(pod, "last_reading")
 
     @property
     def native_value(self) -> float | None:
@@ -359,7 +343,7 @@ class EONEnergiaTokenStatusSensor(SensorEntity):
         self._pod = pod
         self._entry = entry
         self._api = api
-        self._attr_unique_id = f"{pod}_token_status_v4"
+        self._attr_unique_id = unique_id(pod, "token_status_v4")
         self._attr_device_info = {
             "identifiers": {(DOMAIN, pod)},
             "name": f"EON Energia {pod}",
@@ -455,10 +439,10 @@ class EONEnergiaCumulativeEnergySensor(RestoreEntity, SensorEntity):
                 "F3": "Off-peak (F3)",
             }
             self._attr_name = f"Cumulative Energy {fascia_names.get(fascia, fascia)}"
-            self._attr_unique_id = f"{pod}_cumulative_energy_{fascia.lower()}"
+            self._attr_unique_id = unique_id(pod, f"cumulative_energy_{fascia.lower()}")
         else:
             self._attr_name = "Cumulative Energy"
-            self._attr_unique_id = f"{pod}_cumulative_energy_total"
+            self._attr_unique_id = unique_id(pod, "cumulative_energy_total")
 
         self._attr_device_info = {
             "identifiers": {(DOMAIN, pod)},
@@ -549,13 +533,13 @@ class EONEnergiaCumulativeEnergySensor(RestoreEntity, SensorEntity):
                 self._cumulative_total,
             )
 
-    def _calculate_day_total(self, day_data: HourlyConsumption, date: datetime) -> float:
+    def _calculate_day_total(self, day_data: HourlyConsumption, day: datetime) -> float:
         """Total consumption for a day, optionally filtered by tariff band."""
         total = 0.0
         for hour, value in sorted(day_data.values.items()):
             if value <= 0:
                 continue
-            if self._fascia and fascia_for_hour(date, hour) != self._fascia:
+            if self._fascia and fascia_for_hour(day, hour) != self._fascia:
                 continue
             total += value
         return round(total, 3)
@@ -604,7 +588,7 @@ class EONEnergiaLatestInvoiceSensor(CoordinatorEntity, SensorEntity):
         super().__init__(coordinator)
         self._pod = pod
         self._entry = entry
-        self._attr_unique_id = f"{pod}_latest_invoice"
+        self._attr_unique_id = unique_id(pod, "latest_invoice")
         self._attr_device_info = {
             "identifiers": {(DOMAIN, pod)},
             "name": f"EON Energia {pod}",
@@ -705,7 +689,7 @@ class EONEnergiaInvoicePaymentStatusSensor(CoordinatorEntity, SensorEntity):
         super().__init__(coordinator)
         self._pod = pod
         self._entry = entry
-        self._attr_unique_id = f"{pod}_invoice_payment_status"
+        self._attr_unique_id = unique_id(pod, "invoice_payment_status")
         self._attr_device_info = {
             "identifiers": {(DOMAIN, pod)},
             "name": f"EON Energia {pod}",
@@ -789,7 +773,7 @@ class EONEnergiaUnpaidInvoicesSensor(CoordinatorEntity, SensorEntity):
         super().__init__(coordinator)
         self._pod = pod
         self._entry = entry
-        self._attr_unique_id = f"{pod}_unpaid_invoices"
+        self._attr_unique_id = unique_id(pod, "unpaid_invoices")
         self._attr_device_info = {
             "identifiers": {(DOMAIN, pod)},
             "name": f"EON Energia {pod}",
@@ -862,7 +846,7 @@ class EONEnergiaTotalInvoicedSensor(RestoreEntity, SensorEntity):
         self.coordinator = coordinator
         self._pod = pod
         self._entry = entry
-        self._attr_unique_id = f"{pod}_total_invoiced"
+        self._attr_unique_id = unique_id(pod, "total_invoiced")
         self._attr_device_info = {
             "identifiers": {(DOMAIN, pod)},
             "name": f"EON Energia {pod}",

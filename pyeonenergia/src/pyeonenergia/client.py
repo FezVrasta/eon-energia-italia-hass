@@ -16,6 +16,7 @@ from .config import get_api_config
 from .exceptions import (
     EonEnergiaApiError,
     EonEnergiaAuthError,
+    EonEnergiaConfigError,
 )
 from .models import (
     Account,

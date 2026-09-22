@@ -1,308 +1,117 @@
-"""EON Energia integration for Home Assistant."""
+"""The EON Energia (Italy) integration."""
 
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, time, timedelta, timezone
-from typing import Any
+from dataclasses import dataclass
 
-import voluptuous as vol
-
-from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.models import (
-    StatisticData,
-    StatisticMeanType,
-    StatisticMetaData,
-)
-from homeassistant.components.recorder.statistics import (
-    async_add_external_statistics,
-    statistics_during_period,
-)
-from homeassistant.components.sensor import SensorDeviceClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, CURRENCY_EURO, Platform, UnitOfEnergy
-from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from homeassistant.util import dt as dt_util
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 
-from pyeonenergia import (
-    EonEnergiaApiError,
-    EonEnergiaAuthError,
-    EonEnergiaClient,
-    PointOfDelivery,
-    fascia_for_hour,
-    hour_start_for_field,
-    is_italian_holiday,
-    parse_italian_date,
-)
+from pyeonenergia import EonEnergiaApiError, EonEnergiaClient, PointOfDelivery
+
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_POD,
     CONF_REFRESH_TOKEN,
     CONF_TARIFF_TYPE,
-    DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     TARIFF_MULTIORARIA,
-    INVOICE_SCAN_INTERVAL,
 )
+from .coordinator import EonConsumptionCoordinator, EonInvoiceCoordinator
+from .services import async_register_services
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.SENSOR]
 
-# Fixed Italian national holidays (month, day)
+
+@dataclass
+class EonEnergiaData:
+    """What one configured supply needs at runtime."""
+
+    api: EonEnergiaClient
+    pod: str
+    tariff_type: str
+    coordinator: EonConsumptionCoordinator
+    invoice_coordinator: EonInvoiceCoordinator
+    supply: PointOfDelivery | None
 
 
-
-
-
-
-
-
-def _get_price_for_date(
-    hass: HomeAssistant,
-    pod: str,
-    target_date: date,
-    fascia: str | None = None,
-) -> tuple[float | None, bool]:
-    """Get the price per kWh for a POD for a specific month.
-
-    Looks up the per-month price calculated from invoices.
-    Returns None for months that haven't been invoiced yet.
-
-    Returns:
-        Tuple of (price, True) if price is available for this month,
-        (None, False) otherwise.
-    """
-    monthly_prices = hass.data[DOMAIN].get("price_per_kwh_monthly", {}).get(pod, {})
-    month_key = (target_date.year, target_date.month)
-    if month_key in monthly_prices:
-        return (monthly_prices[month_key], True)
-    return (None, False)
-
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up EON Energia from a config entry."""
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Register services, which exist whether or not an entry is configured."""
     hass.data.setdefault(DOMAIN, {})
-
-    access_token = entry.data[CONF_ACCESS_TOKEN]
-    refresh_token = entry.data.get(CONF_REFRESH_TOKEN)
-    pod = entry.data[CONF_POD]
-    username = entry.data.get(CONF_USERNAME)
-    password = entry.data.get(CONF_PASSWORD)
-
-    def token_refresh_callback(new_access_token: str, new_refresh_token: str) -> None:
-        """Persist rotated tokens without reloading the entry.
-
-        async_update_entry fires the update listener, which reloads the whole
-        integration and re-imports several days of statistics. That was tolerable
-        when a refresh was a rare event; tokens are now refreshed shortly before
-        they expire, so it would happen every couple of hours. Flag the entry so
-        async_reload_entry knows this particular update is only the tokens.
-        """
-        _LOGGER.debug("Tokens refreshed, updating config entry")
-        hass.data[DOMAIN].setdefault("token_only_updates", set()).add(entry.entry_id)
-        new_data = {
-            **entry.data,
-            CONF_ACCESS_TOKEN: new_access_token,
-            CONF_REFRESH_TOKEN: new_refresh_token,
-        }
-        hass.config_entries.async_update_entry(entry, data=new_data)
-
-    api = EonEnergiaClient(
-        access_token=access_token,
-        refresh_token=refresh_token,
-        token_callback=token_refresh_callback,
-        username=username,
-        password=password,
-    )
-
-    # Validate the token (will auto-refresh if needed and refresh token is available)
-    if not await api.validate_token():
-        _LOGGER.error("Invalid EON Energia access token")
-        await api.close()
-        return False
-
-    # Get tariff type, default to multioraria for backwards compatibility
-    tariff_type = entry.data.get(CONF_TARIFF_TYPE, TARIFF_MULTIORARIA)
-
-    # Track the last imported date to avoid re-importing
-    # Also track if historical import is in progress to prevent conflicts
-    import_state: dict[str, Any] = {"last_date": None, "importing_historical": False}
-
-    async def async_update_data():
-        """Fetch data from EON Energia API and import statistics."""
-        # Skip auto-import if historical import is in progress
-        if import_state.get("importing_historical"):
-            _LOGGER.debug("Skipping auto-import: historical import in progress")
-            # Still fetch and return data for sensors, just don't import statistics
-            try:
-                for days_ago in range(2, 8):
-                    target_date = datetime.now() - timedelta(days=days_ago)
-                    data = await api.get_daily_consumption(
-                        pod=pod,
-                        start_date=target_date,
-                        end_date=target_date,
-                    )
-                    if data and len(data) > 0:
-                        return [data[0] if isinstance(data, list) else data]
-                return []
-            except EonEnergiaApiError:
-                return []
-
-        try:
-            # EON data has a 2-day delay, try multiple days to find the most recent data
-            all_data = []
-            for days_ago in range(2, 8):  # Try from 2 to 7 days ago
-                target_date = datetime.now() - timedelta(days=days_ago)
-                data = await api.get_daily_consumption(
-                    pod=pod,
-                    start_date=target_date,
-                    end_date=target_date,
-                )
-                if data and len(data) > 0:
-                    all_data.append((target_date, data[0] if isinstance(data, list) else data))
-
-            if not all_data:
-                _LOGGER.warning("No consumption data found for the last 7 days")
-                return []
-
-            # Sort by date (oldest first for correct running sum calculation)
-            all_data.sort(key=lambda x: x[0])
-            most_recent_date, most_recent_data = all_data[-1]
-
-            _LOGGER.debug(
-                "Found consumption data for %s",
-                most_recent_date.strftime("%Y-%m-%d"),
-            )
-
-            # Auto-import statistics for any new days we haven't processed yet
-            # Filter to only days we haven't imported
-            days_to_import = []
-            for target_date, day_data in all_data:
-                date_str = target_date.strftime("%Y-%m-%d")
-                data_date = day_data.day.isoformat() if day_data.day else date_str
-
-                # Skip if we've already imported this date
-                if import_state["last_date"] and data_date <= import_state["last_date"]:
-                    continue
-                days_to_import.append((target_date, day_data))
-
-            # Import all new days as a batch to maintain correct running sums
-            if days_to_import:
-                await _import_days_batch(
-                    hass, days_to_import, pod, tariff_type
-                )
-
-            # Update the last imported date (use last item = most recent)
-            if all_data:
-                last_target, last_reading = all_data[-1]
-                import_state["last_date"] = (
-                    last_reading.day.isoformat()
-                    if last_reading.day
-                    else last_target.strftime("%Y-%m-%d")
-                )
-
-            # Return the most recent day's data for the sensors
-            return [most_recent_data]
-
-        except EonEnergiaAuthError as err:
-            raise UpdateFailed(f"Authentication failed: {err}") from err
-        except EonEnergiaApiError as err:
-            raise UpdateFailed(f"Error communicating with API: {err}") from err
-
-    # Invoice coordinator (updates less frequently)
-    # NOTE: Invoice coordinator is set up BEFORE consumption coordinator so that
-    # the average €/kWh price is calculated before consumption statistics are imported.
-    # This ensures cost statistics are available from the first data import.
-    async def async_update_invoices():
-        """Fetch invoice data from EON Energia API and import cost statistics."""
-        try:
-            invoices = await api.get_invoices_for_pod(pod)
-            _LOGGER.debug("Fetched %d invoices for POD %s", len(invoices), pod)
-
-            # Import cost statistics from invoices (also fetches per-fascia pricing)
-            if invoices:
-                await _import_invoice_cost_statistics(hass, api, invoices, pod)
-
-            return invoices
-        except EonEnergiaAuthError as err:
-            raise UpdateFailed(f"Authentication failed: {err}") from err
-        except EonEnergiaApiError as err:
-            raise UpdateFailed(f"Error fetching invoices: {err}") from err
-
-    invoice_coordinator = DataUpdateCoordinator(
-        hass,
-        _LOGGER,
-        name=f"{DOMAIN}_invoices",
-        update_method=async_update_invoices,
-        update_interval=timedelta(hours=INVOICE_SCAN_INTERVAL),
-    )
-
-    # Fetch initial invoice data first (to calculate average €/kWh for cost statistics)
-    # Use non-blocking refresh so integration still loads if invoice API is down
-    try:
-        await invoice_coordinator.async_config_entry_first_refresh()
-    except Exception as err:
-        _LOGGER.warning(
-            "Could not fetch invoice data during setup (will retry later): %s",
-            err,
-        )
-        # Don't fail setup - invoices are optional, consumption data is the priority
-
-    coordinator = DataUpdateCoordinator(
-        hass,
-        _LOGGER,
-        name=DOMAIN,
-        update_method=async_update_data,
-        update_interval=timedelta(hours=DEFAULT_SCAN_INTERVAL),
-    )
-
-    # Fetch initial consumption data (will now include cost statistics if price was calculated)
-    await coordinator.async_config_entry_first_refresh()
-
-    # The contract behind this supply: contracted power, distributor, product and
-    # when the offer ends. It changes about once a year, so it is fetched at setup
-    # rather than polled, and a failure here must not block the integration.
-    supply: PointOfDelivery | None = None
-    try:
-        supply = await api.get_point_of_delivery(pod)
-        _LOGGER.debug(
-            "Supply %s: %s, %s kW contracted, offer ends %s",
-            pod,
-            supply.product_name,
-            supply.contractual_power,
-            supply.contract_end,
-        )
-    except EonEnergiaApiError as err:
-        _LOGGER.warning("Could not fetch supply details for %s: %s", pod, err)
-
-    hass.data[DOMAIN][entry.entry_id] = {
-        "api": api,
-        "supply": supply,
-        "coordinator": coordinator,
-        "invoice_coordinator": invoice_coordinator,
-        "pod": pod,
-        "tariff_type": tariff_type,
-        "import_state": import_state,  # Share import state with service handler
-    }
-
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    # Register update listener for config entry changes
-    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
-
+    async_register_services(hass)
     return True
 
 
-async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the config entry when its options change.
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up one E.ON Energia supply."""
+    hass.data.setdefault(DOMAIN, {})
 
-    Skips the reload when the change was only a rotated token, which the
-    coordinator writes back routinely and which nothing needs reloading for.
+    pod = entry.data[CONF_POD]
+    tariff_type = entry.data.get(CONF_TARIFF_TYPE, TARIFF_MULTIORARIA)
+
+    api = EonEnergiaClient(
+        access_token=entry.data[CONF_ACCESS_TOKEN],
+        refresh_token=entry.data.get(CONF_REFRESH_TOKEN),
+        token_callback=_token_callback(hass, entry),
+        username=entry.data.get(CONF_USERNAME),
+        password=entry.data.get(CONF_PASSWORD),
+    )
+
+    if not await api.validate_token():
+        await api.close()
+        raise ConfigEntryAuthFailed("EON Energia rejected the stored credentials")
+
+    invoice_coordinator = EonInvoiceCoordinator(hass, api, pod)
+    coordinator = EonConsumptionCoordinator(hass, api, pod, tariff_type)
+
+    # Invoices first: costs are derived from them, so the consumption import
+    # needs the prices already in hand. A failure here is not fatal - costs are
+    # optional, consumption is the point.
+    try:
+        await invoice_coordinator.async_config_entry_first_refresh()
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning(
+            "Could not fetch invoice data during setup (will retry later): %s", err
+        )
+
+    await coordinator.async_config_entry_first_refresh()
+
+    entry.runtime_data = EonEnergiaData(
+        api=api,
+        pod=pod,
+        tariff_type=tariff_type,
+        coordinator=coordinator,
+        invoice_coordinator=invoice_coordinator,
+        supply=await _fetch_supply(api, pod),
+    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Tear one supply down."""
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        await entry.runtime_data.api.close()
+    return unload_ok
+
+
+async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload when the entry's options change.
+
+    Skips the reload when the change was only a rotated token, which the client
+    writes back routinely and which nothing needs reloading for.
     """
-    pending = hass.data.get(DOMAIN, {}).get("token_only_updates")
-    if pending and entry.entry_id in pending:
+    pending: set[str] = hass.data.setdefault(DOMAIN, {}).setdefault(
+        "token_only_updates", set()
+    )
+    if entry.entry_id in pending:
         pending.discard(entry.entry_id)
         _LOGGER.debug("Config entry updated with refreshed tokens, not reloading")
         return
@@ -310,876 +119,51 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     await hass.config_entries.async_reload(entry.entry_id)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        data = hass.data[DOMAIN].pop(entry.entry_id)
-        await data["api"].close()
+def _token_callback(hass: HomeAssistant, entry: ConfigEntry):
+    """Return a callback that persists rotated tokens without a reload.
 
-    return unload_ok
-
-
-async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    """Set up the EON Energia component."""
-    hass.data.setdefault(DOMAIN, {})
-
-    async def handle_import_statistics(call: ServiceCall) -> None:
-        """Handle the import_statistics service call."""
-        days = call.data.get("days", 90)
-        clear_existing = call.data.get("clear_existing", False)
-
-        _LOGGER.info("Starting historical data import for the last %d days", days)
-
-        # Get all configured entries - create a copy to avoid "dictionary changed size during iteration"
-        entries_found = 0
-        for entry_id, entry_data in list(hass.data[DOMAIN].items()):
-            _LOGGER.debug(
-                "Checking entry %s: is_dict=%s, has_api=%s",
-                entry_id,
-                isinstance(entry_data, dict),
-                "api" in entry_data if isinstance(entry_data, dict) else False,
-            )
-            if not isinstance(entry_data, dict) or "api" not in entry_data:
-                continue
-
-            entries_found += 1
-            api = entry_data["api"]
-            pod = entry_data["pod"]
-            tariff_type = entry_data.get("tariff_type", TARIFF_MULTIORARIA)
-
-            _LOGGER.info(
-                "Importing statistics for POD %s (tariff: %s, days: %d, clear_existing: %s)",
-                pod,
-                tariff_type,
-                days,
-                clear_existing,
-            )
-
-            # Clear existing statistics if requested
-            if clear_existing:
-                statistic_ids = [
-                    f"{DOMAIN}:{pod}_consumption",
-                    f"{DOMAIN}:{pod}_consumption_f1",
-                    f"{DOMAIN}:{pod}_consumption_f2",
-                    f"{DOMAIN}:{pod}_consumption_f3",
-                    f"{DOMAIN}:{pod}_cost",
-                ]
-                _LOGGER.info("Clearing existing statistics: %s", statistic_ids)
-                # Must go through the recorder's own scheduling, not a generic
-                # executor job: statistics_meta_manager.delete() asserts it is
-                # running on the recorder thread and raises "Detected unsafe
-                # call not in recorder thread" otherwise, which took the whole
-                # service call down with a 500.
-                get_instance(hass).async_clear_statistics(statistic_ids)
-
-            # Set flag to prevent concurrent imports from coordinator
-            import_state = entry_data.get("import_state", {})
-            import_state["importing_historical"] = True
-
-            # Ensure invoice data is loaded for pricing (but don't fail if it errors)
-            invoice_coordinator = entry_data.get("invoice_coordinator")
-            if invoice_coordinator:
-                _LOGGER.debug("Refreshing invoice data before import...")
-                try:
-                    await invoice_coordinator.async_request_refresh()
-                except Exception as err:
-                    _LOGGER.warning(
-                        "Could not refresh invoice data (will import without cost): %s",
-                        err,
-                    )
-
-            try:
-                # First import consumption statistics (without cost)
-                # This returns daily consumption data we can use for price calculation
-                daily_consumption = await _import_historical_statistics(
-                    hass, api, pod, days, tariff_type
-                )
-
-                # Now that we have consumption data, calculate invoice prices
-                if invoice_coordinator and invoice_coordinator.data:
-                    _LOGGER.info(
-                        "Calculating invoice prices using %d days of consumption data...",
-                        len(daily_consumption),
-                    )
-                    await _import_invoice_cost_statistics(
-                        hass, api, invoice_coordinator.data, pod, daily_consumption
-                    )
-
-                    # Re-import statistics to include cost data
-                    _LOGGER.info("Re-importing statistics with cost data...")
-                    await _import_historical_statistics(hass, api, pod, days, tariff_type)
-
-                # Update last imported date to prevent coordinator from re-importing
-                # these dates with potentially different sums
-                end_date = datetime.now() - timedelta(days=2)
-                import_state["last_date"] = end_date.strftime("%Y-%m-%d")
-            finally:
-                import_state["importing_historical"] = False
-
-        if entries_found == 0:
-            _LOGGER.warning(
-                "No configured EON Energia entries found. "
-                "Available keys in domain data: %s",
-                list(hass.data[DOMAIN].keys()),
-            )
-
-    hass.services.async_register(
-        DOMAIN,
-        "import_statistics",
-        handle_import_statistics,
-        schema=vol.Schema({
-            vol.Optional("days", default=90): vol.All(
-                vol.Coerce(int), vol.Range(min=1, max=365)
-            ),
-            vol.Optional("clear_existing", default=False): bool,
-        }),
-    )
-
-    return True
-
-
-def _stat_row_start(row: dict[str, Any]) -> datetime:
-    """Return a statistics row's start as an aware datetime.
-
-    The recorder hands back a float timestamp on current versions and a
-    datetime on older ones.
+    async_update_entry fires the update listener, which reloads the integration
+    and re-imports several days of statistics. That was tolerable when a refresh
+    was rare; tokens are now refreshed shortly before they expire, so it would
+    happen every couple of hours. Flagging the entry lets async_reload_entry tell
+    this update apart from a real options change.
     """
-    start = row["start"]
-    if isinstance(start, (int, float)):
-        return dt_util.utc_from_timestamp(start)
-    return start
 
-
-async def _build_rebased_statistics(
-    hass: HomeAssistant,
-    statistic_id: str,
-    new_values: dict[datetime, float],
-) -> list[StatisticData]:
-    """Build a statistics series whose cumulative ``sum`` stays monotonic.
-
-    Home Assistant stores a running total per hour and the Energy Dashboard
-    renders the difference between consecutive hours. That means an hour cannot
-    be written in isolation: if it lands before existing data, every later hour
-    has to be renumbered too.
-
-    Seeding the running total from the *latest* stored row (which is what this
-    integration used to do) and then writing earlier hours produced a spike
-    where the rewritten range started and a negative reading where it rejoined
-    untouched data. Both were visible on the Energy Dashboard.
-
-    So: seed from the row immediately before the earliest hour being written,
-    merge the new values over everything from that point on, and recompute the
-    whole tail. Running it twice over the same data is a no-op.
-    """
-    if not new_values:
-        return []
-
-    first_start = min(new_values)
-
-    # Seed from the last cumulative sum strictly before the rewritten range.
-    prior = await get_instance(hass).async_add_executor_job(
-        statistics_during_period,
-        hass,
-        first_start - timedelta(days=730),
-        first_start,
-        [statistic_id],
-        "hour",
-        None,
-        {"sum"},
-    )
-    running = 0.0
-    if prior and prior.get(statistic_id):
-        running = prior[statistic_id][-1].get("sum") or 0.0
-
-    # Everything from the first affected hour onwards has to be renumbered.
-    existing = await get_instance(hass).async_add_executor_job(
-        statistics_during_period,
-        hass,
-        first_start,
-        None,
-        [statistic_id],
-        "hour",
-        None,
-        {"state"},
-    )
-
-    merged: dict[datetime, float] = {}
-    if existing and existing.get(statistic_id):
-        for row in existing[statistic_id]:
-            if row.get("state") is not None:
-                merged[_stat_row_start(row)] = float(row["state"])
-
-    # Freshly fetched values win over whatever was stored before.
-    merged.update(new_values)
-
-    series: list[StatisticData] = []
-    for start in sorted(merged):
-        running += merged[start]
-        series.append(StatisticData(start=start, sum=running, state=merged[start]))
-
-    _LOGGER.debug(
-        "Rebased %s: %d new hour(s), %d hour(s) rewritten from %s, seed sum=%.3f",
-        statistic_id,
-        len(new_values),
-        len(series),
-        first_start,
-        running - sum(merged.values()),
-    )
-    return series
-
-
-#: A plausible band for a price derived from one invoice over one month of kWh,
-#: in EUR/kWh. Italian retail electricity sits far inside this; anything outside
-#: it means the invoice and the consumption cover different periods.
-MIN_DERIVED_PRICE = 0.05
-MAX_DERIVED_PRICE = 1.50
-
-
-
-
-
-
-async def _import_days_batch(
-    hass: HomeAssistant,
-    days_data: list[tuple[datetime, dict[str, Any]]],
-    pod: str,
-    tariff_type: str = TARIFF_MULTIORARIA,
-) -> None:
-    """Import multiple days' statistics in a single batch with correct running sums.
-
-    This function processes multiple days sequentially, maintaining proper cumulative
-    sums across all days. It retrieves the last known sum once at the start and
-    then builds on it for all subsequent entries.
-    """
-    if not days_data:
-        return
-
-    is_multioraria = tariff_type == TARIFF_MULTIORARIA
-
-    # Check if we have any pricing available
-    monthly_prices = hass.data[DOMAIN].get("price_per_kwh_monthly", {}).get(pod, {})
-    has_pricing = bool(monthly_prices)
-
-    # Define statistics based on tariff type
-    stat_configs: dict[str, dict[str, Any]] = {
-        "total": {
-            "id": f"{DOMAIN}:{pod}_consumption",
-            "name": f"EON Energia {pod} Consumption",
-            "unit": UnitOfEnergy.KILO_WATT_HOUR,
-            "unit_class": SensorDeviceClass.ENERGY,
-        },
-    }
-
-    if is_multioraria:
-        stat_configs.update({
-            "F1": {
-                "id": f"{DOMAIN}:{pod}_consumption_f1",
-                "name": f"EON Energia {pod} F1 (Peak)",
-                "unit": UnitOfEnergy.KILO_WATT_HOUR,
-                "unit_class": SensorDeviceClass.ENERGY,
-            },
-            "F2": {
-                "id": f"{DOMAIN}:{pod}_consumption_f2",
-                "name": f"EON Energia {pod} F2 (Mid-peak)",
-                "unit": UnitOfEnergy.KILO_WATT_HOUR,
-                "unit_class": SensorDeviceClass.ENERGY,
-            },
-            "F3": {
-                "id": f"{DOMAIN}:{pod}_consumption_f3",
-                "name": f"EON Energia {pod} F3 (Off-peak)",
-                "unit": UnitOfEnergy.KILO_WATT_HOUR,
-                "unit_class": SensorDeviceClass.ENERGY,
-            },
-        })
-
-    if has_pricing:
-        stat_configs["cost"] = {
-            "id": f"{DOMAIN}:{pod}_cost",
-            "name": f"EON Energia {pod} Cost",
-            "unit": CURRENCY_EURO,
-            "unit_class": None,
-        }
-
-    # Collect the hourly values per statistic. Cumulative sums are deliberately
-    # NOT computed here: _build_rebased_statistics() works them out against
-    # whatever is already stored, so an overlapping re-import stays monotonic.
-    new_values: dict[str, dict[datetime, float]] = {key: {} for key in stat_configs}
-
-    for date, reading in days_data:
-        # hours() resolves E.ON's 24 fields against the real local day, so the
-        # spring-forward and autumn days come back with 23 and 24 entries rather
-        # than a collision.
-        for hour, stat_time, hourly_value in reading.hours():
-            if hourly_value <= 0:
-                continue
-
-            new_values["total"][stat_time] = hourly_value
-
-            fascia = None
-            if is_multioraria:
-                fascia = fascia_for_hour(date, hour)
-                new_values[fascia][stat_time] = hourly_value
-
-            if has_pricing:
-                hourly_price, _ = _get_price_for_date(hass, pod, date.date(), fascia)
-                if hourly_price:
-                    new_values["cost"][stat_time] = hourly_value * hourly_price
-
-    # Import all statistics at once
-    for key, config in stat_configs.items():
-        series = await _build_rebased_statistics(hass, config["id"], new_values[key])
-        if series:
-            metadata = StatisticMetaData(
-                has_mean=False,
-                has_sum=True,
-                mean_type=StatisticMeanType.NONE,
-                name=config["name"],
-                source=DOMAIN,
-                statistic_id=config["id"],
-                unit_of_measurement=config["unit"],
-                unit_class=config["unit_class"],
-            )
-            async_add_external_statistics(hass, metadata, series)
-
-    _LOGGER.info(
-        "Batch imported %d days of statistics (%.3f kWh across %d hours)",
-        len(days_data),
-        sum(new_values["total"].values()),
-        len(new_values["total"]),
-    )
-
-
-async def _import_day_statistics(
-    hass: HomeAssistant,
-    day_data: dict[str, Any],
-    date: datetime,
-    pod: str,
-    tariff_type: str = TARIFF_MULTIORARIA,
-) -> None:
-    """Import a single day's hourly statistics to the recorder.
-
-    This function imports hourly energy consumption data as external statistics,
-    which can be used by the Energy Dashboard. It also imports cost statistics
-    using date-specific pricing from invoices when available.
-    """
-    is_multioraria = tariff_type == TARIFF_MULTIORARIA
-
-    # Check if we have any pricing available (for cost statistic setup)
-    monthly_prices = hass.data[DOMAIN].get("price_per_kwh_monthly", {}).get(pod, {})
-    has_pricing = bool(monthly_prices)
-
-    # Define statistics based on tariff type
-    stat_configs: dict[str, dict[str, Any]] = {
-        "total": {
-            "id": f"{DOMAIN}:{pod}_consumption",
-            "name": f"EON Energia {pod} Consumption",
-            "unit": UnitOfEnergy.KILO_WATT_HOUR,
-            "unit_class": SensorDeviceClass.ENERGY,
-        },
-    }
-
-    if is_multioraria:
-        stat_configs.update({
-            "F1": {
-                "id": f"{DOMAIN}:{pod}_consumption_f1",
-                "name": f"EON Energia {pod} F1 (Peak)",
-                "unit": UnitOfEnergy.KILO_WATT_HOUR,
-                "unit_class": SensorDeviceClass.ENERGY,
-            },
-            "F2": {
-                "id": f"{DOMAIN}:{pod}_consumption_f2",
-                "name": f"EON Energia {pod} F2 (Mid-peak)",
-                "unit": UnitOfEnergy.KILO_WATT_HOUR,
-                "unit_class": SensorDeviceClass.ENERGY,
-            },
-            "F3": {
-                "id": f"{DOMAIN}:{pod}_consumption_f3",
-                "name": f"EON Energia {pod} F3 (Off-peak)",
-                "unit": UnitOfEnergy.KILO_WATT_HOUR,
-                "unit_class": SensorDeviceClass.ENERGY,
-            },
-        })
-
-    # Add cost statistic if we have any pricing available
-    if has_pricing:
-        stat_configs["cost"] = {
-            "id": f"{DOMAIN}:{pod}_cost",
-            "name": f"EON Energia {pod} Cost",
-            "unit": CURRENCY_EURO,
-            "unit_class": None,
-        }
-
-    # Hourly values only; _build_rebased_statistics() computes the cumulative
-    # sums against what is already stored. Re-importing a day that has already
-    # been imported is then a no-op rather than a discontinuity.
-    new_values: dict[str, dict[datetime, float]] = {key: {} for key in stat_configs}
-
-    for hour, stat_time, hourly_value in day_data.hours():
-        if hourly_value <= 0:
-            continue
-
-        new_values["total"][stat_time] = hourly_value
-
-        fascia = None
-        if is_multioraria:
-            fascia = fascia_for_hour(date, hour)
-            new_values[fascia][stat_time] = hourly_value
-
-        # Date-specific pricing, derived from the invoices
-        if has_pricing:
-            hourly_price, _ = _get_price_for_date(hass, pod, date.date(), fascia)
-            if hourly_price:
-                new_values["cost"][stat_time] = hourly_value * hourly_price
-
-    # Track whether we used invoice pricing or fallback
-    _, is_from_invoice = _get_price_for_date(hass, pod, date.date())
-    pricing_source = "from invoice" if is_from_invoice else "estimated"
-
-    # Import statistics for each type
-    for key, config in stat_configs.items():
-        series = await _build_rebased_statistics(hass, config["id"], new_values[key])
-        if series:
-            metadata = StatisticMetaData(
-                has_mean=False,
-                has_sum=True,
-                mean_type=StatisticMeanType.NONE,
-                name=config["name"],
-                source=DOMAIN,
-                statistic_id=config["id"],
-                unit_of_measurement=config["unit"],
-                unit_class=config["unit_class"],
-            )
-            async_add_external_statistics(hass, metadata, series)
-
-    data_date = day_data.day.isoformat() if day_data.day else date.strftime("%Y-%m-%d")
-    day_total = sum(new_values["total"].values())
-    if has_pricing:
-        _LOGGER.info(
-            "Auto-imported %d hourly statistics for %s (total: %.3f kWh, cost: €%.2f - %s)",
-            len(new_values["total"]),
-            data_date,
-            day_total,
-            sum(new_values.get("cost", {}).values()),
-            pricing_source,
+    def persist(new_access_token: str, new_refresh_token: str) -> None:
+        _LOGGER.debug("Tokens refreshed, updating config entry")
+        hass.data.setdefault(DOMAIN, {}).setdefault("token_only_updates", set()).add(
+            entry.entry_id
         )
-    else:
-        _LOGGER.info(
-            "Auto-imported %d hourly statistics for %s (total: %.3f kWh)",
-            len(new_values["total"]),
-            data_date,
-            day_total,
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_ACCESS_TOKEN: new_access_token,
+                CONF_REFRESH_TOKEN: new_refresh_token,
+            },
         )
 
+    return persist
 
 
+async def _fetch_supply(api: EonEnergiaClient, pod: str) -> PointOfDelivery | None:
+    """Read the contract behind this supply.
 
-#: The API times out server-side on long hourly ranges. A month at a time is
-#: comfortably inside what it will answer.
-HISTORY_CHUNK_DAYS = 30
-
-#: Narrowest window worth retrying before giving up on it.
-MIN_CHUNK_DAYS = 4
-
-
-async def _fetch_consumption_chunked(
-    api: EonEnergiaClient,
-    pod: str,
-    start_date: datetime,
-    end_date: datetime,
-    chunk_days: int = HISTORY_CHUNK_DAYS,
-) -> list[dict[str, Any]] | None:
-    """Fetch daily consumption over a long range, a chunk at a time.
-
-    Returns the concatenated rows, or None if nothing could be fetched at all.
-    Chunks that fail even at the minimum width are skipped with a warning rather
-    than losing the rest of the range: a gap in one month should not cost the
-    other eleven.
+    Contracted power, distributor, product and when the offer ends. It changes
+    about once a year, so it is read at setup rather than polled, and failing to
+    read it must not block the integration.
     """
-    collected: list[dict[str, Any]] = []
-    any_success = False
-    window_start = start_date
-
-    while window_start <= end_date:
-        window_end = min(window_start + timedelta(days=chunk_days - 1), end_date)
-        width = chunk_days
-
-        while True:
-            try:
-                rows = await api.get_daily_consumption(
-                    pod=pod, start_date=window_start, end_date=window_end
-                )
-                collected.extend(rows or [])
-                any_success = True
-                break
-            except EonEnergiaApiError as err:
-                if width <= MIN_CHUNK_DAYS:
-                    _LOGGER.warning(
-                        "Skipping %s..%s after repeated failures: %s",
-                        window_start.strftime("%Y-%m-%d"),
-                        window_end.strftime("%Y-%m-%d"),
-                        err,
-                    )
-                    break
-                width = max(width // 2, MIN_CHUNK_DAYS)
-                window_end = min(window_start + timedelta(days=width - 1), end_date)
-                _LOGGER.debug(
-                    "Chunk failed (%s); retrying %s..%s at %d days",
-                    err,
-                    window_start.strftime("%Y-%m-%d"),
-                    window_end.strftime("%Y-%m-%d"),
-                    width,
-                )
-
-        window_start = window_end + timedelta(days=1)
-
-    if not any_success:
-        _LOGGER.error("Failed to fetch any consumption data for the requested range")
+    try:
+        supply = await api.get_point_of_delivery(pod)
+    except EonEnergiaApiError as err:
+        _LOGGER.warning("Could not fetch supply details for %s: %s", pod, err)
         return None
 
-    _LOGGER.info(
-        "Fetched %d days across %s..%s",
-        len(collected),
-        start_date.strftime("%Y-%m-%d"),
-        end_date.strftime("%Y-%m-%d"),
-    )
-    return collected
-
-
-async def _import_historical_statistics(
-    hass: HomeAssistant,
-    api: EonEnergiaClient,
-    pod: str,
-    days: int,
-    tariff_type: str = TARIFF_MULTIORARIA,
-) -> dict[str, float]:
-    """Import historical statistics from EON Energia API.
-
-    Returns:
-        Dict mapping date strings (YYYY-MM-DD) to daily kWh consumption totals.
-        This can be used to calculate invoice prices.
-    """
-    _LOGGER.info(
-        "Starting _import_historical_statistics for POD %s (days: %d, tariff: %s)",
+    _LOGGER.debug(
+        "Supply %s: %s, %s kW contracted, offer ends %s",
         pod,
-        days,
-        tariff_type,
+        supply.product_name,
+        supply.contractual_power,
+        supply.contract_end,
     )
-
-    is_multioraria = tariff_type == TARIFF_MULTIORARIA
-
-    # Check if we have any pricing available (for cost statistic setup)
-    monthly_prices = hass.data[DOMAIN].get("price_per_kwh_monthly", {}).get(pod, {})
-    has_pricing = bool(monthly_prices)
-
-    _LOGGER.info(
-        "Pricing info: %d months with prices: %s",
-        len(monthly_prices),
-        list(monthly_prices.keys()) if monthly_prices else "none",
-    )
-
-    # Define statistics based on tariff type
-    stat_configs: dict[str, dict[str, Any]] = {
-        "total": {
-            "id": f"{DOMAIN}:{pod}_consumption",
-            "name": f"EON Energia {pod} Consumption",
-            "unit": UnitOfEnergy.KILO_WATT_HOUR,
-            "unit_class": SensorDeviceClass.ENERGY,
-        },
-    }
-
-    # Only add fascia statistics for multioraria tariffs
-    if is_multioraria:
-        stat_configs.update({
-            "F1": {
-                "id": f"{DOMAIN}:{pod}_consumption_f1",
-                "name": f"EON Energia {pod} F1 (Peak)",
-                "unit": UnitOfEnergy.KILO_WATT_HOUR,
-                "unit_class": SensorDeviceClass.ENERGY,
-            },
-            "F2": {
-                "id": f"{DOMAIN}:{pod}_consumption_f2",
-                "name": f"EON Energia {pod} F2 (Mid-peak)",
-                "unit": UnitOfEnergy.KILO_WATT_HOUR,
-                "unit_class": SensorDeviceClass.ENERGY,
-            },
-            "F3": {
-                "id": f"{DOMAIN}:{pod}_consumption_f3",
-                "name": f"EON Energia {pod} F3 (Off-peak)",
-                "unit": UnitOfEnergy.KILO_WATT_HOUR,
-                "unit_class": SensorDeviceClass.ENERGY,
-            },
-        })
-
-    # Add cost statistic if we have any pricing available
-    if has_pricing:
-        stat_configs["cost"] = {
-            "id": f"{DOMAIN}:{pod}_cost",
-            "name": f"EON Energia {pod} Cost",
-            "unit": CURRENCY_EURO,
-            "unit_class": None,
-        }
-
-    # Use timezone-aware dates to avoid DST issues
-    # The API dates are in local Italian time, so we use that for consistency
-    now = dt_util.now()  # Timezone-aware datetime
-    end_date = now - timedelta(days=2)  # API has 2-day delay
-    start_date = end_date - timedelta(days=days)
-
-    # Hourly values only. This function used to seed a running sum from the data
-    # before start_date, which got the head of the range right but left every
-    # hour *after* the range holding its old total - a negative reading on the
-    # Energy Dashboard where the two met. _build_rebased_statistics() renumbers
-    # the tail as well.
-    new_values: dict[str, dict[datetime, float]] = {key: {} for key in stat_configs}
-
-    # Count invoiced vs estimated days for logging
-    invoiced_days = 0
-    estimated_days = 0
-
-    # Track daily consumption for invoice price calculation
-    daily_consumption: dict[str, float] = {}
-
-    _LOGGER.info(
-        "Fetching EON Energia data from %s to %s (tariff: %s)",
-        start_date.strftime("%Y-%m-%d"),
-        end_date.strftime("%Y-%m-%d"),
-        tariff_type,
-    )
-
-    # Fetch in chunks. Asking for a long range in one call makes the API time out
-    # on its own side and answer HTTP 500 with "[1062] Read timed out" - a 200 day
-    # request fails reliably, while a month's worth comes back fine. A failed chunk
-    # is retried at half the width before being given up on, so one bad window
-    # costs that window rather than the whole import.
-    all_data = await _fetch_consumption_chunked(api, pod, start_date, end_date)
-    if all_data is None:
-        return daily_consumption
-
-    if not all_data:
-        _LOGGER.warning("No consumption data returned from API")
-        return daily_consumption
-
-    _LOGGER.info("Received %d days of consumption data", len(all_data))
-
-    # Process each day's data
-    for reading in all_data:
-        if reading.day is None:
-            continue
-
-        date_str = reading.day.isoformat()
-        current_date = datetime.combine(reading.day, time.min)
-        day_total = 0.0
-
-        for hour, stat_time, hourly_value in reading.hours():
-            if hourly_value <= 0:
-                continue
-
-            day_total += hourly_value
-            new_values["total"][stat_time] = hourly_value
-
-            # Fascia-specific statistic (only for multioraria)
-            fascia = None
-            if is_multioraria:
-                fascia = fascia_for_hour(current_date, hour)
-                new_values[fascia][stat_time] = hourly_value
-
-            if has_pricing:
-                hourly_price, _ = _get_price_for_date(hass, pod, current_date.date(), fascia)
-                if hourly_price:
-                    new_values["cost"][stat_time] = hourly_value * hourly_price
-
-        # Store daily consumption for invoice price calculation
-        if day_total > 0:
-            daily_consumption[date_str] = day_total
-
-        # Track pricing status
-        _, is_from_invoice = _get_price_for_date(hass, pod, current_date.date())
-        if is_from_invoice:
-            invoiced_days += 1
-        else:
-            estimated_days += 1
-
-    # Import statistics for each type
-    for key, config in stat_configs.items():
-        series = await _build_rebased_statistics(hass, config["id"], new_values[key])
-        if series:
-            metadata = StatisticMetaData(
-                has_mean=False,
-                has_sum=True,
-                mean_type=StatisticMeanType.NONE,
-                name=config["name"],
-                source=DOMAIN,
-                statistic_id=config["id"],
-                unit_of_measurement=config["unit"],
-                unit_class=config["unit_class"],
-            )
-            _LOGGER.info(
-                "Importing %d new hourly statistics for %s (%d rewritten)",
-                len(new_values[key]),
-                config["name"],
-                len(series),
-            )
-            async_add_external_statistics(hass, metadata, series)
-
-    if has_pricing:
-        _LOGGER.info(
-            "Historical data import completed for %s (total: %.3f kWh, cost: €%.2f) - "
-            "%d days from invoices, %d days estimated",
-            pod,
-            sum(new_values["total"].values()),
-            sum(new_values.get("cost", {}).values()),
-            invoiced_days,
-            estimated_days,
-        )
-    else:
-        _LOGGER.info(
-            "Historical data import completed for %s (total: %.3f kWh, %d days)",
-            pod,
-            sum(new_values["total"].values()),
-            len(daily_consumption),
-        )
-
-    return daily_consumption
-
-
-async def _import_invoice_cost_statistics(
-    hass: HomeAssistant,
-    api: EonEnergiaClient,
-    invoices: list[dict[str, Any]],
-    pod: str,
-    daily_consumption: dict[str, float] | None = None,
-) -> None:
-    """Calculate per-month €/kWh from invoices and official monthly consumption.
-
-    Uses the ExtMonthlyConsumption API to get official monthly kWh values,
-    then matches each invoice to its month and calculates €/kWh.
-    """
-    if not invoices:
-        _LOGGER.warning("Cannot calculate prices: no invoices")
-        return
-
-    # Fetch official monthly consumption from API
-    start_date = datetime.now() - timedelta(days=365 * 2)
-    end_date = datetime.now()
-
-    try:
-        monthly_data = await api.get_monthly_consumption(
-            pod=pod,
-            start_date=start_date,
-            end_date=end_date,
-        )
-    except EonEnergiaApiError as err:
-        _LOGGER.error("Failed to fetch monthly consumption: %s", err)
-        return
-
-    # Build monthly consumption lookup: (year, month) -> kWh
-    monthly_consumption: dict[tuple[int, int], float] = {}
-    for record in monthly_data:
-        data_str = record.get("data")  # Format: "2025-11-01"
-        kwh = record.get("valore_mensile", 0)
-        if data_str and kwh:
-            try:
-                record_date = datetime.strptime(data_str, "%Y-%m-%d")
-                month_key = (record_date.year, record_date.month)
-                monthly_consumption[month_key] = float(kwh)
-            except (ValueError, TypeError):
-                continue
-
-    _LOGGER.info(
-        "Monthly consumption from API: %s",
-        {f"{y}-{m:02d}": f"{kwh:.2f} kWh" for (y, m), kwh in sorted(monthly_consumption.items())},
-    )
-
-    # Process each invoice
-    monthly_prices: dict[tuple[int, int], float] = {}
-
-    for invoice in invoices:
-        # DataDocumento is not modelled; it only appears on some document types,
-        # so fall back through raw before giving up.
-        invoice_date = invoice.issued_on or parse_italian_date(
-            invoice.raw.get("DataDocumento") or invoice.raw.get("Data")
-        )
-        if not invoice_date:
-            continue
-
-        forniture = invoice.raw.get("ListaForniture", [])
-        for fornitura in forniture:
-            codice_fornitura = fornitura.get("CodiceFornitura", "")
-            codice_pdr_pod = fornitura.get("CodicePDR_POD", "")
-            if pod in (codice_fornitura, codice_pdr_pod):
-                try:
-                    amount = float(
-                        fornitura.get("ImportoFornitura") or fornitura.get("Importo", 0)
-                    )
-                    if amount <= 0:
-                        break
-
-                    # Invoice emitted in month M covers month M-1
-                    target_month = invoice_date.month - 1
-                    target_year = invoice_date.year
-                    if target_month == 0:
-                        target_month = 12
-                        target_year -= 1
-
-                    month_key = (target_year, target_month)
-                    month_kwh = monthly_consumption.get(month_key, 0.0)
-
-                    if month_kwh <= 0:
-                        _LOGGER.debug(
-                            "No consumption data for invoice %s month %d-%02d",
-                            invoice.number,
-                            target_year,
-                            target_month,
-                        )
-                        break
-
-                    price_per_kwh = amount / month_kwh
-
-                    if not MIN_DERIVED_PRICE <= price_per_kwh <= MAX_DERIVED_PRICE:
-                        # The invoice and the consumption cover different spans.
-                        # It happens on the first month of data, where a full
-                        # invoice is divided by however many days we managed to
-                        # fetch: one account derived EUR7.16/kWh from EUR165 over
-                        # 23 kWh, which then priced that month's whole cost graph.
-                        # Better no price for the month than a wrong one.
-                        _LOGGER.warning(
-                            "Ignoring implausible price for %d-%02d: €%.2f over "
-                            "%.2f kWh is €%.4f/kWh, outside €%.2f-€%.2f. The "
-                            "invoice most likely covers a longer period than the "
-                            "consumption data available for it",
-                            target_year,
-                            target_month,
-                            amount,
-                            month_kwh,
-                            price_per_kwh,
-                            MIN_DERIVED_PRICE,
-                            MAX_DERIVED_PRICE,
-                        )
-                        break
-
-                    monthly_prices[month_key] = price_per_kwh
-
-                    _LOGGER.info(
-                        "Invoice %s (€%.2f) for %d-%02d: %.2f kWh -> €%.4f/kWh",
-                        invoice.number,
-                        amount,
-                        target_year,
-                        target_month,
-                        month_kwh,
-                        price_per_kwh,
-                    )
-                except (ValueError, TypeError):
-                    pass
-                break
-
-    if not monthly_prices:
-        _LOGGER.warning("No monthly prices could be calculated")
-        return
-
-    hass.data[DOMAIN].setdefault("price_per_kwh_monthly", {})[pod] = monthly_prices
-
-    _LOGGER.info(
-        "Calculated monthly prices for %s: %s",
-        pod,
-        {f"{y}-{m:02d}": f"€{p:.4f}/kWh" for (y, m), p in sorted(monthly_prices.items())},
-    )
+    return supply

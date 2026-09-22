@@ -10,9 +10,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from pyeonenergia import EonEnergiaApiError, EonEnergiaClient
+from pyeonenergia import EonEnergiaApiError, EonEnergiaClient, PointOfDelivery
 
-from .const import DOMAIN
+from .entity import EonEnergiaSupplyEntity
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -23,17 +23,13 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up EON Energia binary sensors from a config entry."""
-    data = hass.data[DOMAIN][entry.entry_id]
+    data = entry.runtime_data
     async_add_entities(
-        [
-            EONEnergiaTerminationAvailableSensor(
-                entry, data["pod"], data["api"], data.get("supply")
-            )
-        ]
+        [EONEnergiaTerminationAvailableSensor(data.pod, data.api, data.supply)]
     )
 
 
-class EONEnergiaTerminationAvailableSensor(BinarySensorEntity):
+class EONEnergiaTerminationAvailableSensor(EonEnergiaSupplyEntity, BinarySensorEntity):
     """Whether E.ON would accept a request to terminate this supply.
 
     Despite E.ON calling the endpoint "Disalimentazione", this is **not** a
@@ -46,29 +42,19 @@ class EONEnergiaTerminationAvailableSensor(BinarySensorEntity):
     sitting `on` in a dashboard invites exactly the wrong conclusion.
     """
 
-    _attr_has_entity_name = True
     _attr_translation_key = "termination_available"
     _attr_entity_registry_enabled_default = False
 
     def __init__(
         self,
-        entry: ConfigEntry,
         pod: str,
         api: EonEnergiaClient,
-        supply: Any | None,
+        supply: PointOfDelivery | None,
     ) -> None:
         """Bind to the supply this entry is configured for."""
-        self._pod = pod
+        self._init_supply(pod, "termination_available", supply)
         self._api = api
-        self._supply = supply
         self._message: str | None = None
-        self._attr_unique_id = f"{pod}_termination_available"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, pod)},
-            "name": f"EON Energia {pod}",
-            "manufacturer": "EON Energia",
-            "model": (supply.product_name if supply else None) or "Smart Meter",
-        }
 
     @property
     def is_on(self) -> bool | None:

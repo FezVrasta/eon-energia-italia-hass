@@ -20,7 +20,6 @@ from pyeonenergia import (
     EonEnergiaApiError,
     EonEnergiaAuth,
     EonEnergiaAuthError,
-    EonEnergiaCaptchaError,
     EonEnergiaClient,
     EonEnergiaMfaRequiredError,
     PointOfDelivery,

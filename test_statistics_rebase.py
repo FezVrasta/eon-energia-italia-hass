@@ -114,9 +114,13 @@ def _load_integration():
         except Exception:
             sys.modules[f"{pkg_name}.{name}"] = _Permissive(f"{pkg_name}.{name}")
 
-    spec = importlib.util.spec_from_file_location(f"{pkg_name}.__init__", base / "__init__.py")
+    # statistics.py, not __init__.py: the rebasing lives there now, and it pulls
+    # in far less of Home Assistant.
+    spec = importlib.util.spec_from_file_location(
+        f"{pkg_name}.statistics", base / "statistics.py"
+    )
     module = importlib.util.module_from_spec(spec)
-    sys.modules[f"{pkg_name}.__init__"] = module
+    sys.modules[f"{pkg_name}.statistics"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -153,7 +157,7 @@ def _assert_series_sane() -> None:
 
 async def _run() -> None:
     _install_stubs()
-    build = _load_integration()._build_rebased_statistics
+    build = _load_integration().build_rebased_statistics
     results = []
 
     def record(name, fn):
