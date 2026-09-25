@@ -12,11 +12,14 @@ first day of statistics lands without a cost.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any
 
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.statistics import get_last_statistics
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from pyeonenergia import (
     EonEnergiaApiError,
@@ -32,9 +35,9 @@ from .statistics import import_days_batch, import_invoice_cost_statistics
 _LOGGER = logging.getLogger(__name__)
 
 #: E.ON publish hourly readings about two days in arrears, and occasionally
-#: later. Walking back a week finds the most recent day that actually exists
-#: without assuming a fixed lag.
-OLDEST_DAY_TO_TRY = 8
+#: later. Asking for the last week finds the most recent day that actually
+#: exists without assuming a fixed lag.
+OLDEST_DAY_TO_TRY = 7
 NEWEST_DAY_TO_TRY = 2
 
 
@@ -66,21 +69,55 @@ class EonConsumptionCoordinator(DataUpdateCoordinator[list[HourlyConsumption]]):
         }
 
     async def _fetch_recent_days(self) -> list[tuple[datetime, HourlyConsumption]]:
-        """Return every day we can find in the last week, oldest first."""
-        found: list[tuple[datetime, HourlyConsumption]] = []
-        for days_ago in range(NEWEST_DAY_TO_TRY, OLDEST_DAY_TO_TRY):
-            target = datetime.now() - timedelta(days=days_ago)
-            readings = await self.api.get_daily_consumption(
-                pod=self.pod, start_date=target, end_date=target
-            )
-            if readings:
-                found.append((target, readings[0]))
+        """Return every day we can find in the last week, oldest first.
 
-        found.sort(key=lambda item: item[0])
-        return found
+        One ranged request: each call costs several seconds, and asking day by
+        day kept setup waiting on six of them.
+        """
+        now = datetime.now()
+        readings = await self.api.get_daily_consumption(
+            pod=self.pod,
+            start_date=now - timedelta(days=OLDEST_DAY_TO_TRY),
+            end_date=now - timedelta(days=NEWEST_DAY_TO_TRY),
+        )
+
+        by_day: dict[datetime, HourlyConsumption] = {}
+        for reading in readings:
+            if reading.day is None:
+                continue
+            by_day.setdefault(datetime.combine(reading.day, time()), reading)
+
+        return sorted(by_day.items())
+
+    async def _seed_last_date(self) -> None:
+        """Pick up where the previous run stopped importing.
+
+        Without this every restart re-imported the whole week, and rebasing a
+        week of hourly sums is most of what setup spent its time on.
+        """
+        statistic_id = f"{DOMAIN}:{self.pod}_consumption"
+        last = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
+        )
+        if not last.get(statistic_id):
+            return
+
+        start = last[statistic_id][0]["start"]
+        if isinstance(start, (int, float)):
+            start = dt_util.utc_from_timestamp(start)
+        last_hour = dt_util.as_local(start)
+
+        # A day only counts once its final hour is stored.
+        last_day = last_hour.date()
+        if last_hour.hour != 23:
+            last_day -= timedelta(days=1)
+        self.import_state["last_date"] = last_day.isoformat()
 
     async def _async_update_data(self) -> list[HourlyConsumption]:
         """Fetch the latest readings, importing any day not yet seen."""
+        if self.import_state["last_date"] is None:
+            await self._seed_last_date()
+
         try:
             days = await self._fetch_recent_days()
         except EonEnergiaAuthError as err:
